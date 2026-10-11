@@ -7,10 +7,12 @@ counter. Output is 48 half-hour kWh values per day type, used by the planner.
 from __future__ import annotations
 
 from datetime import datetime, timezone, tzinfo
-from statistics import median
 from typing import Any
 
 MAX_HOURLY_KWH = 25.0  # drop counter resets / spikes
+# A day's weight halves every this many days, so the profile follows seasonal change
+# (heating evenings in autumn) instead of averaging it away over the whole history.
+HALF_LIFE_DAYS = 5.0
 
 
 def hourly_consumption(points: list[dict[str, Any]]) -> list[tuple[datetime, float]]:
@@ -41,28 +43,36 @@ def build_load_profile(
     *,
     min_days_per_type: int = 4,
 ) -> dict[str, Any] | None:
-    """Median kWh per local half-hour; split weekday/weekend when there's enough history."""
-    buckets: dict[str, list[list[float]]] = {
+    """Recency-weighted mean kWh per local half-hour; split weekday/weekend when there's enough history.
+
+    A mean, not a median: the load counter steps in 0.1 kWh, so hourly values are mostly 0.3 or 0.4
+    and the median sat on the lower one, and it ignored loads that come most but not all nights.
+    """
+    buckets: dict[str, list[list[tuple[float, float]]]] = {
         "weekday": [[] for _ in range(24)],
         "weekend": [[] for _ in range(24)],
         "all": [[] for _ in range(24)],
     }
     days: dict[str, set] = {"weekday": set(), "weekend": set(), "all": set()}
+    newest = max((start for start, _ in hourly), default=None)
     for start, kwh in hourly:
         local = start.astimezone(tz)
         kind = "weekend" if local.weekday() >= 5 else "weekday"
+        age_days = (newest - start).total_seconds() / 86400.0
+        weight = 0.5 ** (age_days / HALF_LIFE_DAYS)
         for key in (kind, "all"):
-            buckets[key][local.hour].append(kwh)
+            buckets[key][local.hour].append((kwh, weight))
             days[key].add(local.date())
     if not days["all"]:
         return None
 
-    def halves(hours: list[list[float]]) -> list[float] | None:
+    def halves(hours: list[list[tuple[float, float]]]) -> list[float] | None:
         if any(not h for h in hours):
             return None
         out: list[float] = []
         for values in hours:
-            half = round(median(values) / 2.0, 4)
+            mean = sum(k * w for k, w in values) / sum(w for _, w in values)
+            half = round(mean / 2.0, 4)
             out.extend([half, half])
         return out
 

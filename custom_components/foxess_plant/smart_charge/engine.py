@@ -44,10 +44,12 @@ def compute_plan(
     kwh_remaining: float | None,
     inverter_min_soc_pct: float | None,
     round_trip_efficiency: float | None = None,
+    previous_plan: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build and optimise the plan. CPU-bound — call from an executor.
 
     ``round_trip_efficiency`` overrides the configured value (Fox Plant passes the measured one).
+    ``previous_plan`` is the plan being replaced; its slots are kept unless clearly beaten.
     """
     if not capacity_kwh or capacity_kwh <= 0:
         return [], {"error": "Battery capacity unavailable"}
@@ -94,7 +96,7 @@ def compute_plan(
         load_fallback_kw=fallback_kw,
         carbon_periods=carbon_periods,
     )
-    plan, summary = planner.build_plan(slots, soc_kwh, params, tz=tz, now=now)
+    plan, summary = planner.build_plan(slots, soc_kwh, params, tz=tz, now=now, previous_plan=previous_plan)
     cap = float(capacity_kwh)
     tomorrow_afternoon = (now.astimezone(tz) + timedelta(days=1)).replace(
         hour=15, minute=0, second=0, microsecond=0

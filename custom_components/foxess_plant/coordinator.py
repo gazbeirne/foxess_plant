@@ -136,6 +136,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._smart_charge_target_max_soc: float | None = None
         self._smart_charge_load_profile: dict[str, Any] | None = None
         self._smart_charge_load_profile_at: datetime | None = None
+        self._smart_charge_capacity_kwh: float | None = None
+        self._smart_charge_capacity_at: datetime | None = None
         self._unsub_smart_charge_meter_recheck: callable | None = None
         self._storm_forecast_active = False
         self._storm_forecast_detail = {}
@@ -2628,6 +2630,75 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ]
         return build_load_profile(hourly_consumption(points), local_tz())
 
+    async def _async_smart_charge_measured_capacity(self, efficiency: float) -> float | None:
+        """Usable battery kWh per 100 % SOC measured from recorder history (refreshed every 6h).
+
+        Re-derived from the recorder after a restart, so nothing needs persisting.
+        """
+        from homeassistant.util import dt as dt_util
+
+        now = dt_util.utcnow()
+        if (
+            self._smart_charge_capacity_at is not None
+            and now - self._smart_charge_capacity_at < timedelta(hours=6)
+        ):
+            return self._smart_charge_capacity_kwh
+        self._smart_charge_capacity_at = now
+        capacity = None
+        try:
+            capacity = await self._async_fetch_smart_charge_measured_capacity(now, efficiency)
+        except Exception as err:  # noqa: BLE001 — recorder may be unavailable
+            _LOGGER.warning("SmartCharge measured battery capacity unavailable: %s", err)
+        self._smart_charge_capacity_kwh = capacity
+        return capacity
+
+    async def _async_fetch_smart_charge_measured_capacity(self, now: datetime, efficiency: float) -> float | None:
+        from homeassistant.components.recorder import get_instance
+
+        from .discovery import resolve_entity_id
+        from .smart_charge.battery_metrics import measured_usable_capacity_kwh
+        from .websocket_api import _fetch_statistics_points
+
+        ids = {
+            key: resolve_entity_id(self.hass, self.plant.entity_map, key, device_id=self.plant.device_id)
+            for key in ("battery_soc", "battery_discharge_total", "battery_charge_total")
+        }
+        if not all(ids.values()):
+            return None
+        scales = {}
+        for key in ("battery_discharge_total", "battery_charge_total"):
+            unit = (self._entity_unit(key) or "").strip()
+            scales[key] = {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0}.get(unit)
+            if scales[key] is None:
+                return None
+        start = now - timedelta(days=max(1, int(self.plant.smart_charge.load_history_days or 14)), hours=1)
+        recorder = get_instance(self.hass)
+        soc_stats = await recorder.async_add_executor_job(
+            _fetch_statistics_points, self.hass, start, now, [ids["battery_soc"]], "hour", "mean"
+        )
+        sum_ids = [ids["battery_discharge_total"], ids["battery_charge_total"]]
+        sum_stats = await recorder.async_add_executor_job(
+            _fetch_statistics_points, self.hass, start, now, sum_ids, "hour", "sum"
+        )
+
+        def hourly(key: str) -> dict[float, float]:
+            # A row's sum is the counter at the END of its hour: diff consecutive rows.
+            rows = sum_stats.get(ids[key]) or []
+            return {
+                b["start"]: (b["mean"] - a["mean"]) * scales[key]
+                for a, b in zip(rows, rows[1:])
+                if b["start"] - a["start"] == 3600 and b["mean"] >= a["mean"]
+            }
+
+        soc_mean = {p["start"]: p["mean"] for p in soc_stats.get(ids["battery_soc"]) or []}
+        return measured_usable_capacity_kwh(
+            soc_mean,
+            hourly("battery_discharge_total"),
+            hourly("battery_charge_total"),
+            round_trip_efficiency=efficiency,
+            nominal_kwh=self._battery_capacity_kwh(),
+        )
+
     async def _rebuild_smart_charge_daily_plan(self, *, reason: str = "manual") -> None:
         from homeassistant.util import dt as dt_util
 
@@ -2642,6 +2713,12 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         carbon_periods, _greener = self._smart_charge_greener_inputs()
         load_profile = await self._async_smart_charge_load_profile()
         efficiency, efficiency_source = self._round_trip_efficiency()
+        capacity_source = "nominal"
+        measured_capacity = await self._async_smart_charge_measured_capacity(efficiency)
+        if measured_capacity is not None and soc_pct is not None:
+            # The BMS nominal size (and its kWh-remaining figure) overstates what each % delivers.
+            capacity_kwh, kwh_remaining, capacity_source = measured_capacity, None, "measured"
+        previous_plan = list(self._smart_charge_daily_plan or [])
 
         def job():
             return compute_plan(
@@ -2657,10 +2734,13 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 kwh_remaining=kwh_remaining,
                 inverter_min_soc_pct=self._entity_float("min_soc"),
                 round_trip_efficiency=efficiency,
+                previous_plan=previous_plan,
             )
 
         plan, meta = await self.hass.async_add_executor_job(job)
         meta["round_trip_efficiency_source"] = efficiency_source
+        meta["capacity_kwh"] = round(capacity_kwh, 2) if capacity_kwh else None
+        meta["capacity_source"] = capacity_source
         meta["rates_sig"] = plan_rates_signature(import_rows, now)
         meta["forecast_sig"] = forecast_signature(forecast_rows)
         meta["replan_reason"] = reason
@@ -4834,6 +4914,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Settings changed — force a fresh plan (and reload load history).
         self._smart_charge_plan_meta = {}
         self._smart_charge_load_profile_at = None
+        self._smart_charge_capacity_at = None
         self._setup_smart_charge_timer()
         self._setup_smart_charge_daily_plan_timer()
         self._setup_smart_charge_entity_listener()

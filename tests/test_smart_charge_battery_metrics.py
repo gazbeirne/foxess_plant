@@ -66,5 +66,43 @@ class BatteryMetricsTests(unittest.TestCase):
         self.assertEqual(bm.parse_state_float("12,5"), 12.5)
 
 
+def _nights(nights: int, kwh_per_hour: float, kwh_per_pct: float, *, hours: int = 12, start_soc: float = 95.0):
+    """Hourly SOC means / discharge / charge for nights of steady discharge (daytime charging between)."""
+    soc, dis, chg = {}, {}, {}
+    for n in range(nights):
+        for h in range(hours):
+            t = n * 86400.0 + h * 3600.0
+            soc[t] = start_soc - h * kwh_per_hour / kwh_per_pct
+            dis[t] = kwh_per_hour
+            chg[t] = 0.0
+        day = n * 86400.0 + hours * 3600.0
+        soc[day], dis[day], chg[day] = start_soc, 0.0, 2.0  # recharge hour breaks the run
+    return soc, dis, chg
+
+
+class MeasuredCapacityTests(unittest.TestCase):
+    def test_real_world_ratio(self) -> None:
+        # 9-10 Oct 2026: ~8.0 kWh per 100 % on the discharge counter, measured RTE 0.8.
+        soc, dis, chg = _nights(4, 0.5, 0.08)
+        cap = bm.measured_usable_capacity_kwh(soc, dis, chg, round_trip_efficiency=0.8, nominal_kwh=10.24)
+        self.assertAlmostEqual(cap, 8.0 / 0.8**0.5, places=1)
+
+    def test_charging_hours_are_skipped(self) -> None:
+        soc, dis, chg = _nights(4, 0.5, 0.08)
+        # A charging hour with a bogus SOC jump must not count.
+        soc[6 * 3600.0] -= 20
+        chg[6 * 3600.0] = 1.0
+        cap = bm.measured_usable_capacity_kwh(soc, dis, chg, round_trip_efficiency=0.8, nominal_kwh=10.24)
+        self.assertAlmostEqual(cap, 8.0 / 0.8**0.5, places=1)
+
+    def test_too_little_history(self) -> None:
+        soc, dis, chg = _nights(1, 0.5, 0.08)
+        self.assertIsNone(bm.measured_usable_capacity_kwh(soc, dis, chg, round_trip_efficiency=0.8, nominal_kwh=10.24))
+
+    def test_implausible_against_nominal(self) -> None:
+        soc, dis, chg = _nights(4, 0.5, 0.03)  # 3 kWh per 100 % on a 10 kWh pack: counters wrong
+        self.assertIsNone(bm.measured_usable_capacity_kwh(soc, dis, chg, round_trip_efficiency=0.8, nominal_kwh=10.24))
+
+
 if __name__ == "__main__":
     unittest.main()

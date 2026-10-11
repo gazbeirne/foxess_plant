@@ -492,6 +492,7 @@ class SimResult:
     grid_export: list[float]
     charged: list[float]  # grid kWh actually used for forced charge
     discharged: list[float]  # battery kWh actually removed by forced export
+    held: list[bool] = field(default_factory=list)  # holding SOC after a charge in the same price run
 
 
 def _terminal_value(slots: list[Slot], params: PlanParams) -> float:
@@ -509,7 +510,12 @@ def simulate(
     discharge: list[float],
     floors: list[float] | None = None,
 ) -> SimResult:
-    """``floors`` overrides ``params.floor_kwh`` per slot (the peak buffer)."""
+    """``floors`` overrides ``params.floor_kwh`` per slot (the peak buffer).
+
+    After a force charge the battery holds for the rest of that equal-price run: the inverter
+    slot is kept on to the end of the run, so once SOC reaches the target the house runs on
+    the (same cheap) grid instead of draining what was just bought.
+    """
     eff = params.eff_one_way
     soc = max(0.0, min(params.capacity_kwh, soc0_kwh))
     cost = 0.0
@@ -518,7 +524,15 @@ def simulate(
     exports: list[float] = []
     charged: list[float] = []
     discharged: list[float] = []
+    held: list[bool] = []
+    hold_price: float | None = None  # price of the run a charge is holding through
+    # Only the cheapest price holds: holding through a dearer band would save the battery for
+    # later at a price that refilling it overnight beats.
+    known = [round(s.import_p, 2) for s in slots if s.price_known]
+    cheapest = min(known) if known else None
     for i, slot in enumerate(slots):
+        price_key = round(slot.import_p, 2)
+        holding = False
         pv = slot.pv_kwh * params.pv_scale
         load = slot.load_kwh * params.load_scale
         imp = 0.0
@@ -538,7 +552,9 @@ def simulate(
                 exp += net - store / eff
             else:
                 imp += -net
+            hold_price = price_key if used_c > 0.01 and price_key == cheapest else None
         elif discharge[i] > 0:
+            hold_price = None
             # Force discharge: battery output serves the house first, remainder exported.
             avail = max(0.0, soc - max(params.export_floor_kwh, floors[i] if floors else 0.0))
             used_d = min(discharge[i], params.discharge_kw * slot.hours, avail)
@@ -548,7 +564,14 @@ def simulate(
                 exp += supply
             else:
                 imp += -supply
+        elif hold_price is not None and price_key == hold_price and slot.price_known and pv <= 0.01:
+            # Holding after a charge: the house runs on the grid. Only while there's no PV, so a
+            # force-charge slot never sits through daylight (what it does with surplus PV once at
+            # target is unproven).
+            holding = True
+            imp += load
         else:
+            hold_price = None
             if net >= 0:
                 store = min(net * eff, max(0.0, params.cap_kwh - soc))
                 soc += store
@@ -567,8 +590,9 @@ def simulate(
         exports.append(exp)
         charged.append(used_c)
         discharged.append(used_d)
+        held.append(holding)
     cost -= max(0.0, soc - params.floor_kwh) * _terminal_value(slots, params)
-    return SimResult(cost, socs, imports, exports, charged, discharged)
+    return SimResult(cost, socs, imports, exports, charged, discharged, held)
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +712,12 @@ def _chunk_sizes(room: float) -> list[float]:
 # price slot and the charge keeps sliding until the cheap window runs out.
 TIE_P = 0.05
 
+# Bonus per kWh for a move into a slot the previous plan already had for that action. Charging
+# later in a cheap band is always a hair cheaper (an earlier charge then feeds the house for the
+# rest of the band, losing the round trip), so each half-hourly rebuild would push a charge
+# already written to the inverter later. A real price gap (a cheaper band) is bigger and still wins.
+STICKY_P_PER_KWH = 2.0
+
 
 def _adjacent(amounts: list[float], i: int) -> bool:
     return (i > 0 and amounts[i - 1] > 0) or (i + 1 < len(amounts) and amounts[i + 1] > 0)
@@ -700,9 +730,15 @@ def optimise(
     *,
     tz: tzinfo = timezone.utc,
     max_iterations: int = 400,
+    previous: list[str | None] | None = None,
 ) -> tuple[list[float], list[float], SimResult]:
-    """Greedy cost descent: repeatedly apply the single best charge/export move."""
+    """Greedy cost descent: repeatedly apply the single best charge/export move.
+
+    ``previous`` is the last plan's action per slot (see ``previous_actions``); those slots
+    get a ``STICKY_P_PER_KWH`` bonus so the plan doesn't drift between rebuilds.
+    """
     n = len(slots)
+    previous = previous if previous and len(previous) == n else [None] * n
     # The export budget is per local day, so each evening peak can export to the floor.
     days = [s.start.astimezone(tz).date() for s in slots]
     # Hard plunge rule: every negative-price slot is a full-rate force charge, whatever
@@ -756,6 +792,8 @@ def optimise(
                             continue
                         # Tie-break towards slots next to existing charge: fewer, longer windows.
                         score = saving + (0.25 if _adjacent(charge, i) else 0.0)
+                        if previous[i] == ACTION_CHARGE:
+                            score += STICKY_P_PER_KWH * moved
                         if best is None or score > best[0] + TIE_P:
                             best = (score, "c", i, size)
                 # Export move.
@@ -779,6 +817,8 @@ def optimise(
                         if saving < params.min_saving_p_per_kwh * moved:
                             continue
                         score = saving + (0.25 if _adjacent(discharge, i) else 0.0)
+                        if previous[i] == ACTION_EXPORT:
+                            score += STICKY_P_PER_KWH * moved
                         if best is None or score > best[0] + TIE_P:
                             best = (score, "d", i, size)
             if best is None:
@@ -837,6 +877,16 @@ class PlanSummary:
         return out
 
 
+def previous_actions(slots: list[Slot], previous_plan: list[dict[str, Any]] | None) -> list[str | None]:
+    """The previous plan's action for each slot, matched by start time (None where it had none)."""
+    by_start: dict[datetime, str] = {}
+    for entry in previous_plan or []:
+        start = parse_iso(entry.get("start_utc"))
+        if start is not None and entry.get("action"):
+            by_start[start] = str(entry["action"])
+    return [by_start.get(s.start) for s in slots]
+
+
 def build_plan(
     slots: list[Slot],
     soc0_kwh: float,
@@ -844,9 +894,12 @@ def build_plan(
     *,
     tz: tzinfo,
     now: datetime,
+    previous_plan: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], PlanSummary]:
     """Optimise and serialise the plan (one dict per half-hour)."""
-    charge, discharge, result = optimise(slots, soc0_kwh, params, tz=tz)
+    charge, discharge, result = optimise(
+        slots, soc0_kwh, params, tz=tz, previous=previous_actions(slots, previous_plan)
+    )
     baseline = simulate(
         slots, soc0_kwh, params, [0.0] * len(slots), [0.0] * len(slots), slot_floors(slots, params)
     )
@@ -865,6 +918,10 @@ def build_plan(
         elif result.charged[i] > 0.01:
             action = ACTION_CHARGE
             reason = "grid_charge"
+        elif result.held[i]:
+            # Part of the charge window on the inverter: at target it holds instead of feeding the house.
+            action = ACTION_CHARGE
+            reason = "hold"
         elif result.discharged[i] > 0.01:
             action = ACTION_EXPORT
             reason = "export_peak"

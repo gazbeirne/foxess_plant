@@ -3101,7 +3101,7 @@ function renderSmartChargePlannedTable(slots) {
     return `<p class="placeholder">No daily plan slots in recorder history for this period.</p>`;
   }
   const items = rows
-    .slice()
+    .filter((row) => row.reason !== "hold") // holding at target after a charge — no energy planned
     .sort((a, b) => (b.start_ms || 0) - (a.start_ms || 0))
     .map((row) => {
       const isExport = String(row.action || "").includes("export");
@@ -3146,6 +3146,9 @@ function renderHemsEventSlots(ev) {
     const start = hemsSlotTime(s.start, s.start_utc);
     const end = hemsSlotTime(s.end, null);
     const when = start ? (end ? `${start}–${end}` : start) : "slot";
+    if (s.reason === "hold") {
+      return `<div class="fox-sc-hems-slot">${esc(when)} · <span style="color:var(--secondary-text-color)">hold (house on grid)</span></div>`;
+    }
     const kwh = s[kwhKey] != null ? ` · ${formatSmartChargeKwh(s[kwhKey])}` : "";
     const used = s.actual_kwh != null && Number(s.actual_kwh) > 0.1;
     const tag = used
@@ -8693,7 +8696,8 @@ function smartChargePlanActionLabel(action) {
 function smartChargeTimelineSlotTip(slot) {
   const start = String(slot.start || "?");
   const end = String(slot.end || "?");
-  const action = smartChargePlanActionLabel(slot.action);
+  const action =
+    slot.reason === "hold" ? "Hold (charged, house on grid)" : smartChargePlanActionLabel(slot.action);
   const importP =
     slot.import_p_per_kwh != null && Number.isFinite(Number(slot.import_p_per_kwh))
       ? `${Number(slot.import_p_per_kwh).toFixed(1)}p`

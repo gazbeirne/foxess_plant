@@ -440,6 +440,69 @@ class TimeOfUseTests(unittest.TestCase):
                 self.assertTrue(charge_slots(plan), now)
                 self.assertEqual(plan[0]["action"], "charge", now)
 
+    def _night_slots(self, now, later_load_kwh):
+        """Cheap until 05:00 then three 45p hours with 0.3 kWh/slot load; the 04:30 slot's load is
+        ``later_load_kwh`` (a slightly bigger load there makes charging in it a hair better)."""
+        out = []
+        t = planner.floor_half_hour(now.astimezone(UTC))
+        while t.astimezone(TZ).hour < 8:
+            lt = t.astimezone(TZ)
+            price = 18.05 if lt.hour < 5 else 45.25
+            load = later_load_kwh if (lt.hour, lt.minute) == (4, 30) else (0.05 if lt.hour < 5 else 0.3)
+            out.append(planner.Slot(start=t, end=t + timedelta(minutes=30), import_p=price, export_p=13.0,
+                                    pv_kwh=0.0, load_kwh=load))
+            t += timedelta(minutes=30)
+        return out
+
+    def _small_need_params(self):
+        # Energy left at the end is worth nothing, so only what the peak needs is charged.
+        return params(charge_kw=3.6, round_trip_efficiency=0.8, terminal_p_per_kwh=0.0)
+
+    def test_charge_starts_early_and_holds_to_the_end_of_the_cheap_band(self) -> None:
+        # 11 Oct 2026: an early charge used to look dearer (it then fed the house for the rest of
+        # the band), so every rebuild pushed it later. The inverter holds at target until the slot
+        # ends, so the plan charges at once and holds.
+        now = local(2026, 10, 11, 3, 0)
+        plan, _ = planner.build_plan(self._night_slots(now, 0.15), 1.0, self._small_need_params(), tz=TZ, now=now)
+        cheap = [e for e in plan if e["import_p_per_kwh"] == 18.05]
+        self.assertEqual(cheap[0]["reason"], "grid_charge")
+        self.assertTrue(all(e["action"] == "charge" for e in cheap))
+        self.assertIn("hold", {e["reason"] for e in cheap})
+        held = [e for e in cheap if e["reason"] == "hold"]
+        self.assertTrue(all(e["soc_end_pct"] == held[0]["soc_end_pct"] for e in held))  # battery idle
+        self.assertEqual(charge_slots(plan)[-1]["end"], "05:00")  # inverter slot runs to the band end
+        self.assertEqual([e for e in plan if e["import_p_per_kwh"] > 40 and e["action"] == "charge"], [])
+
+    def test_previous_plan_keeps_its_slot_against_noise(self) -> None:
+        now = local(2026, 10, 11, 3, 0)
+        # Agile-style: every slot a slightly different price; 04:00 is a twentieth of a penny
+        # cheaper than 03:00. No load in the cheap slots, so only the price differs.
+        agile = {"03:00": 18.05, "03:30": 18.07, "04:00": 18.0, "04:30": 18.08}
+        slots = [
+            planner.Slot(start=s.start, end=s.end, export_p=13.0, pv_kwh=0.0,
+                         load_kwh=0.0 if s.import_p < 40 else s.load_kwh,
+                         import_p=agile.get(s.start.astimezone(TZ).strftime("%H:%M"), s.import_p + k * 0.01))
+            for k, s in enumerate(self._night_slots(now, 0.05))
+        ]
+        fresh, _ = planner.build_plan(slots, 1.0, self._small_need_params(), tz=TZ, now=now)
+        previous = [{"start_utc": slots[0].start.isoformat(), "action": "charge"}]
+        sticky, _ = planner.build_plan(
+            slots, 1.0, self._small_need_params(), tz=TZ, now=now, previous_plan=previous
+        )
+        self.assertNotEqual(fresh[0]["action"], "charge")  # fresh: the cheaper 04:00 wins...
+        self.assertEqual(sticky[0]["action"], "charge")  # ...but not over the slot already chosen
+
+    def test_previous_plan_yields_to_a_cheaper_band(self) -> None:
+        now = local(2026, 10, 11, 4, 0)
+        slots = self._night_slots(now, 0.05)
+        # The previous plan charged in the peak (45p); the cheap 04:00-05:00 slots must take over.
+        previous = [{"start_utc": s.start.isoformat(), "action": "charge"} for s in slots if s.import_p > 40]
+        plan, _ = planner.build_plan(
+            slots, 1.0, self._small_need_params(), tz=TZ, now=now, previous_plan=previous
+        )
+        self.assertTrue(charge_slots(plan))
+        self.assertTrue(all(e["import_p_per_kwh"] == 18.05 for e in charge_slots(plan)))
+
     def test_agile_is_not_restricted_to_one_band(self) -> None:
         now = local(2026, 3, 10, 16, 0)
         rows = agile_rows(now, 31, lambda t: 10.0 + (t.hour * 60 + t.minute) / 60.0)
@@ -506,7 +569,7 @@ class LoadProfileTests(unittest.TestCase):
             pts.append({"start": t.timestamp(), "mean": total})
         return pts
 
-    def test_profile_medians(self) -> None:
+    def test_profile_per_hour(self) -> None:
         pts = self._points(14, lambda t: 2.0 if t.hour == 18 else 0.4)
         hourly = load_profile.hourly_consumption(pts)
         profile = load_profile.build_load_profile(hourly, ZoneInfo("UTC"))
@@ -516,6 +579,19 @@ class LoadProfileTests(unittest.TestCase):
         self.assertAlmostEqual(profile["all"][3 * 2], 0.2)
         self.assertIn("weekday", profile)
         self.assertIn("weekend", profile)
+
+    def test_quantised_counter_is_not_rounded_down(self) -> None:
+        # 0.1 kWh counter steps: 0.3 on 8 nights, 0.4 on 6. The median said 0.3; the real mean is ~0.34.
+        pts = self._points(14, lambda t: 0.4 if t.day % 7 in (1, 3, 5) else 0.3)
+        profile = load_profile.build_load_profile(load_profile.hourly_consumption(pts), ZoneInfo("UTC"))
+        self.assertGreater(profile["all"][3 * 2] * 2, 0.32)
+        self.assertLess(profile["all"][3 * 2] * 2, 0.4)
+
+    def test_recent_days_count_more(self) -> None:
+        # Evenings grew from 0.3 to 0.6 kWh/h a week ago: the profile should sit near the new level.
+        pts = self._points(14, lambda t: 0.6 if t.day > 7 else 0.3)
+        profile = load_profile.build_load_profile(load_profile.hourly_consumption(pts), ZoneInfo("UTC"))
+        self.assertGreater(profile["all"][20 * 2] * 2, 0.5)
 
     def test_short_history_has_no_weekend_split(self) -> None:
         pts = self._points(3, lambda t: 0.5)

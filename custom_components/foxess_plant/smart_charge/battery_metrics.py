@@ -119,6 +119,51 @@ def _kwh_remaining(
     return None
 
 
+# SOC fall (summed %) needed before the measured capacity is trusted, and how far from the
+# nominal pack size it may be (outside that a counter was probably reset or mis-scaled).
+MEASURED_CAPACITY_MIN_DROP_PCT = 150.0
+MEASURED_CAPACITY_RANGE = (0.6, 1.05)
+
+
+def measured_usable_capacity_kwh(
+    soc_mean: dict[float, float],
+    discharge_kwh: dict[float, float],
+    charge_kwh: dict[float, float],
+    *,
+    round_trip_efficiency: float,
+    nominal_kwh: float | None,
+) -> float | None:
+    """Usable energy per 100 % SOC, measured, in the planner's stored-energy terms.
+
+    Inputs are hourly, keyed by hour-start epoch seconds: SOC mean %, battery discharge kWh and
+    charge kWh in that hour. Pairs of back-to-back hours with no charging tie the SOC fall
+    between the two hourly means to the energy discharged across them. The discharge counter
+    measures what the battery delivered; the planner stores energy one-way efficiency upstream
+    of that, so the result is divided by sqrt(round-trip efficiency).
+    """
+    energy = drop = 0.0
+    for start, soc in soc_mean.items():
+        nxt = start + 3600.0
+        if nxt not in soc_mean or start not in discharge_kwh or nxt not in discharge_kwh:
+            continue
+        if charge_kwh.get(start, 1.0) > 0 or charge_kwh.get(nxt, 1.0) > 0:
+            continue
+        fall = soc - soc_mean[nxt]
+        if fall <= 0:
+            continue
+        energy += (discharge_kwh[start] + discharge_kwh[nxt]) / 2.0
+        drop += fall
+    if drop < MEASURED_CAPACITY_MIN_DROP_PCT or energy <= 0:
+        return None
+    eff_one_way = max(0.3, min(1.0, round_trip_efficiency)) ** 0.5
+    capacity = energy / drop * 100.0 / eff_one_way
+    if nominal_kwh:
+        low, high = MEASURED_CAPACITY_RANGE
+        if not low * nominal_kwh <= capacity <= high * nominal_kwh:
+            return None
+    return round(capacity, 2)
+
+
 def _battery_voltage_v(read_float: Callable[[str], float | None]) -> float | None:
     for key in ("batvolt_1", "invbatvolt_1", "battery_voltage"):
         volts = read_float(key)
@@ -129,6 +174,7 @@ def _battery_voltage_v(read_float: Callable[[str], float | None]) -> float | Non
 
 __all__ = [
     "design_energy_wh_to_kwh",
+    "measured_usable_capacity_kwh",
     "parse_state_float",
     "resolve_battery_metrics",
 ]
