@@ -2088,9 +2088,28 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         score_error=None,
                     )
                     changed = True
+            if changed:
+                # Charts keep each day's blend after the live forecast has moved on
+                self._open_meteo_cache["history"] = om.update_history(
+                    self._open_meteo_cache.get("history") or {},
+                    om.chart_points(self._open_meteo_rows()),
+                    today=dt_util.now().date(),
+                    tz=local_tz(),
+                )
             self._save_open_meteo()
         if changed:
             await self.async_request_refresh()
+
+    def open_meteo_points_for_day(self, day: date) -> list[dict[str, float]]:
+        """Open-Meteo blend chart points (ms, kW) for one local day — [] when Open-Meteo is off."""
+        from . import open_meteo as om
+        from .smart_charge.engine import local_tz
+
+        if not self.plant.open_meteo.enabled:
+            return []
+        return om.points_for_day(
+            om.chart_points(self._open_meteo_rows()), self._open_meteo_cache.get("history") or {}, day, local_tz()
+        )
 
     async def _async_actual_daily_pv(self, start: date, end: date) -> dict[str, float]:
         """kWh per complete local day from the PV energy counters' hourly statistics (pv1 + pv2)."""
@@ -2165,7 +2184,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         days = [(today + timedelta(days=i)).isoformat() for i in range(2)]
         totals = om.model_day_totals(cache.get("forecast") or {}, scores, models, tz)
         blend_daily: dict[str, float] = {}
-        for row in self._open_meteo_rows():
+        rows = self._open_meteo_rows()
+        for row in rows:
             end = dt_util.parse_datetime(row["period_end"])
             day = dt_util.as_local(end - om.HALF_HOUR).date().isoformat()
             blend_daily[day] = blend_daily.get(day, 0.0) + float(row["pv_estimate"]) * 0.5
@@ -2198,6 +2218,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for m in models
             ],
             "blend_day_kwh": {d: round(blend_daily[d], 1) if d in blend_daily else None for d in days},
+            # Yesterday → +2 days, for the Statistics chart's Open-Meteo line
+            "chart_points": om.chart_points(rows),
             "days": days,
             "solcast_fresh": self._solcast_fresh(),
         }
