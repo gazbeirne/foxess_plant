@@ -206,7 +206,13 @@ def _recorder_series(
     for kind in PERFORMANCE_SENSOR_KINDS:
         eid = kind_to_entity.get(kind)
         series[kind] = _stats_to_points(stats.get(eid, [])) if eid else []
+        if eid and kind in WEATHER_UNIT_KINDS:
+            # HA shows (and records) our m/s wind sensor in the user's unit, e.g. km/h: back to m/s
+            series[kind] = _convert_weather_points(series[kind], kind=kind, unit=_entity_unit(hass, eid))
     return series
+
+
+WEATHER_UNIT_KINDS = ("wind_speed_ms", "visibility_km", "dew_point_c")
 
 
 def _daylight_window(hass: HomeAssistant, target_day: date) -> dict[str, float] | None:
@@ -527,6 +533,71 @@ def _ema_smooth_points(
     return out
 
 
+def _thermal_lag_since_ms(coordinator: Any) -> float | None:
+    since = getattr(getattr(coordinator, "_panel_thermal", None), "since", None)
+    parsed = dt_util.parse_datetime(since) if since else None
+    return parsed.timestamp() * 1000 if parsed else None
+
+
+def _smooth_unlagged_points(
+    points: list[dict[str, float]], lagged_since_ms: float | None
+) -> list[dict[str, float]]:
+    """EMA-smooth only the points before ``lagged_since_ms`` (all of them when it's unknown)."""
+    if lagged_since_ms is None:
+        return _ema_smooth_points(points, PANEL_TEMP_SMOOTH_TAU_MIN) or []
+    old = [p for p in points if p["t"] < lagged_since_ms]
+    new = [p for p in points if p["t"] >= lagged_since_ms]
+    return (_ema_smooth_points(old, PANEL_TEMP_SMOOTH_TAU_MIN) or []) + new
+
+
+def build_pv_forecast_series(
+    hass: HomeAssistant,
+    *,
+    target_day: date,
+    stored: dict[str, Any] | None,
+    current_cache: dict[str, Any] | None,
+    memory_snapshots: list[tuple[float, list[dict[str, Any]]]] | None,
+    open_meteo_points: list[dict[str, float]],
+    entry_id: str | None,
+    solcast_enabled: bool,
+) -> tuple[list[dict[str, float]], list[str]]:
+    """The Solar Output chart's PV Forecast line from the forecasts themselves (pv_forecast_line.py).
+
+    Runs in the executor (the Solcast polls of past days come from the recorder). The 5-minute samples only
+    held what was known at each tick: 0 while Solcast was stale, and nothing before a sample existed.
+    """
+    from .pv_forecast_line import pv_forecast_line
+    from .solcast_forecast_chart import build_forecast_intraday_chart_for_range, collect_revision_snapshots
+
+    day_start, day_end = _day_bounds(target_day)
+    start_ms = day_start.timestamp() * 1000
+    end_ms = day_end.timestamp() * 1000
+    snapshots: list[tuple[float, list[dict[str, Any]]]] = []
+    if solcast_enabled or stored:
+        try:
+            snapshots = collect_revision_snapshots(
+                hass, stored, current_cache, start_ms, entry_id=entry_id, memory_snapshots=memory_snapshots
+            )
+        except Exception:  # noqa: BLE001 — Open-Meteo alone still draws a line
+            _LOGGER.debug("PV forecast line: Solcast polls unavailable", exc_info=True)
+    snapshots = [s for s in snapshots if s[0] <= end_ms]
+    solcast_points = (
+        build_forecast_intraday_chart_for_range(
+            snapshots=snapshots, day_start_ms=start_ms, as_of_ms=end_ms, include_future=True
+        )
+        if snapshots
+        else []
+    )
+    return pv_forecast_line(
+        solcast_points=solcast_points,
+        solcast_fetches_ms=[s[0] for s in snapshots],
+        open_meteo_points=open_meteo_points,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        now_ms=dt_util.now().timestamp() * 1000,
+    )
+
+
 def _day_bounds(target_day: date) -> tuple[datetime, datetime]:
     day_start = dt_util.start_of_local_day(
         dt_util.as_local(datetime.combine(target_day, time.min))
@@ -580,10 +651,11 @@ async def async_build_performance_day_chart(
         )
         series = _merge_series(series, modbus_series)
 
-    # Smooth the modelled panel temperature so cloud-edge spikes don't show as unphysical jumps.
+    # Samples from before the thermal lag (performance/panel_thermal.py) are the instant model: smooth those
+    # so cloud edges don't show as unphysical jumps. Newer ones already carry the lag.
     if series.get("virtual_panel_temp_c"):
-        series["virtual_panel_temp_c"] = _ema_smooth_points(
-            series["virtual_panel_temp_c"], PANEL_TEMP_SMOOTH_TAU_MIN
+        series["virtual_panel_temp_c"] = _smooth_unlagged_points(
+            series["virtual_panel_temp_c"], _thermal_lag_since_ms(coordinator)
         )
 
     entities = resolve_performance_entities(hass, entry_id)

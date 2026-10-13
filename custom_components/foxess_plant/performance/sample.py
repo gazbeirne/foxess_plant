@@ -51,9 +51,28 @@ def _entity_power_kw(coordinator: Any, key: str) -> float | None:
 
 
 def _octopus_rates_p_per_kwh(coordinator: Any) -> tuple[float | None, float | None]:
+    """Current import / export p/kWh: the supplier cache, else the rate rows SmartCharge plans with.
+
+    The cache only exists with an import supplier; export from a sensor or another supplier, and band rates,
+    come from the planner's rows (tariff_export.py).
+    """
     cache = coordinator._octopus_cache or {}
     imp = cache.get("current_import_p_per_kwh")
     exp = cache.get("current_export_p_per_kwh")
+    if (imp is None or exp is None) and hasattr(coordinator, "_smart_charge_rate_rows"):
+        from homeassistant.util import dt as dt_util
+
+        from ..octopus_tariff import rate_at
+
+        try:
+            import_rows, export_rows = coordinator._smart_charge_rate_rows()
+        except Exception:  # noqa: BLE001 — no rates is the old behaviour
+            import_rows, export_rows = [], []
+        now = dt_util.utcnow()
+        if imp is None and import_rows:
+            imp = rate_at(now, import_rows)
+        if exp is None and export_rows:
+            exp = rate_at(now, export_rows)
     return (
         float(imp) if imp is not None else None,
         float(exp) if exp is not None else None,
@@ -199,16 +218,95 @@ def _model_panel_temp(
     )
 
 
-def collect_performance_sample(coordinator: Any) -> PerformanceSample:
-    from .clipping import compute_clipping_loss_kw
-    from .weather import read_weather_metrics
+def _thermal_arrays(coordinator: Any) -> list[Any]:
+    from .panel_temp import ArrayThermal
 
+    pv_config = coordinator.plant.pv_config
+    return [
+        ArrayThermal(
+            stc_kw=cfg.effective_dc_w / 1000.0,
+            noct_c=cfg.noct_c,
+            power_temp_coeff_pct=cfg.power_temp_coeff_pct,
+            mounting=cfg.mounting,
+        )
+        for cfg in (pv_config.pv1, pv_config.pv2)
+        if cfg.enabled
+    ]
+
+
+def _pv_power_kw(coordinator: Any) -> float | None:
     pv_kw = _entity_power_kw(coordinator, "pv_power")
     if pv_kw is None:
         for key in ("pv1_power", "pv_power_total"):
             pv_kw = _entity_power_kw(coordinator, key)
             if pv_kw is not None:
                 break
+    return pv_kw
+
+
+def _clipping_kw(coordinator: Any, pv_kw: float | None, forecast_kw: float | None) -> float:
+    from .clipping import compute_clipping_loss_kw
+
+    return compute_clipping_loss_kw(
+        pv_power_kw=pv_kw,
+        inverter_ac_limit_kw=effective_ac_limit_kw(coordinator),
+        potential_kw=forecast_kw,
+        ac_output_kw=_entity_power_kw(coordinator, "inv_power"),
+        battery_charge_kw=_entity_power_kw(coordinator, "battery_charge"),
+    )
+
+
+def _lagged_panel_temp(
+    coordinator: Any,
+    *,
+    pv_kw: float | None,
+    ambient: float | None,
+    wind_ms: float | None,
+    forecast_kw: float | None,
+    held_back: bool,
+) -> tuple[float | None, float | None]:
+    """The steady-state model, passed through the panels' thermal lag (panel_thermal.py)."""
+    from homeassistant.util import dt as dt_util
+
+    target, still_target = _model_panel_temp(
+        coordinator, pv_kw=pv_kw, ambient=ambient, wind_ms=wind_ms, solcast_kw=forecast_kw, held_back=held_back
+    )
+    thermal = getattr(coordinator, "_panel_thermal", None)
+    if thermal is None:
+        return target, still_target
+    return thermal.update(
+        now=dt_util.utcnow(),
+        target_c=target,
+        still_air_target_c=still_target,
+        air_c=ambient,
+        arrays=_thermal_arrays(coordinator),
+        wind_ms=wind_ms,
+    )
+
+
+def step_panel_thermal(coordinator: Any) -> None:
+    """The 30-second step between samples, so the lag follows each cloud rather than a 5-minute snapshot."""
+    from .weather import read_weather_metrics
+
+    pv_kw = _pv_power_kw(coordinator)
+    ambient = _ambient_temp_c(coordinator.hass, coordinator)
+    wind_ms = read_weather_metrics(coordinator.hass, coordinator).get("wind_speed_ms")
+    forecast_kw = coordinator.pv_forecast_now()[0] if hasattr(coordinator, "pv_forecast_now") else None
+    _, still_air = _lagged_panel_temp(
+        coordinator,
+        pv_kw=pv_kw,
+        ambient=ambient,
+        wind_ms=wind_ms,
+        forecast_kw=forecast_kw,
+        held_back=_clipping_kw(coordinator, pv_kw, forecast_kw) > 0,
+    )
+    coordinator._panel_temp_still_air_c = still_air
+
+
+def collect_performance_sample(coordinator: Any) -> PerformanceSample:
+    from .weather import read_weather_metrics
+
+    pv_kw = _pv_power_kw(coordinator)
 
     import_kw = None
     export_kw = None
@@ -237,19 +335,13 @@ def collect_performance_sample(coordinator: Any) -> PerformanceSample:
     if hasattr(coordinator, "pv_forecast_now"):
         solcast_kw, solcast_today = coordinator.pv_forecast_now()
 
-    clipping = compute_clipping_loss_kw(
-        pv_power_kw=pv_kw,
-        inverter_ac_limit_kw=effective_ac_limit_kw(coordinator),
-        potential_kw=solcast_kw,
-        ac_output_kw=_entity_power_kw(coordinator, "inv_power"),
-        battery_charge_kw=_entity_power_kw(coordinator, "battery_charge"),
-    )
-    virtual_temp, still_air_temp = _model_panel_temp(
+    clipping = _clipping_kw(coordinator, pv_kw, solcast_kw)
+    virtual_temp, still_air_temp = _lagged_panel_temp(
         coordinator,
         pv_kw=pv_kw,
         ambient=ambient,
         wind_ms=weather.get("wind_speed_ms"),
-        solcast_kw=solcast_kw,
+        forecast_kw=solcast_kw,
         held_back=clipping > 0,
     )
     coordinator._panel_temp_still_air_c = still_air_temp

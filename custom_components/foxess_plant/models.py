@@ -1227,6 +1227,10 @@ class TariffConfig:
     schedule: Any = None  # TariffScheduleConfig — lazy import to avoid circular refs
     apply_band_inverter_control: bool = False
     dynamic: TariffDynamicConfig = field(default_factory=TariffDynamicConfig)
+    # Who prices export (tariff_export.py): "same" as the import supplier, "manual" band rates, "entity" (a Home
+    # Assistant sensor), or a different supplier's API ("octopus" / "eon_next", login in export_supplier)
+    export_provider: str = "same"
+    export_supplier: TariffDynamicConfig = field(default_factory=TariffDynamicConfig)
     last_updated_at: str | None = None
 
     @classmethod
@@ -1288,6 +1292,24 @@ class TariffConfig:
             import_p=import_p,
             export_p=export_p,
         )
+        from .tariff_export import normalize_export_provider
+
+        dynamic = TariffDynamicConfig.from_dict(raw.get("dynamic"))
+        export_source = _export_source()
+        export_provider = normalize_export_provider(
+            raw.get("export_provider"), dynamic=dynamic, export_source=export_source
+        )
+        # The import supplier fetches export only when export is "same"
+        dynamic.export_from_api = export_provider == "same"
+        export_supplier = TariffDynamicConfig.from_dict(raw.get("export_supplier"))
+        export_supplier.enabled = export_provider in ("octopus", "eon_next")
+        if export_supplier.enabled:
+            export_supplier.provider = export_provider
+            export_supplier.source = "native"
+        if export_provider == "entity":
+            export_source = TARIFF_SOURCE_ENTITY
+        elif export_provider == "manual":
+            export_source = TARIFF_SOURCE_SCHEDULE
 
         return cls(
             kind=kind,
@@ -1295,7 +1317,7 @@ class TariffConfig:
             import_source=_import_source(),
             import_entity=_entity("import_entity"),
             import_p_per_kwh=import_p,
-            export_source=_export_source(),
+            export_source=export_source,
             export_entity=_entity("export_entity"),
             export_p_per_kwh=export_p,
             standing_source=_standing_source(),
@@ -1303,7 +1325,9 @@ class TariffConfig:
             standing_charge_p_per_day=_rate("standing_charge_p_per_day"),
             schedule=schedule,
             apply_band_inverter_control=bool(raw.get("apply_band_inverter_control")),
-            dynamic=TariffDynamicConfig.from_dict(raw.get("dynamic")),
+            dynamic=dynamic,
+            export_provider=export_provider,
+            export_supplier=export_supplier,
             last_updated_at=raw.get("last_updated_at"),
         )
 
@@ -1331,6 +1355,8 @@ class TariffConfig:
             "apply_band_inverter_control": bool(self.apply_band_inverter_control),
             "schedule": schedule.to_dict(),
             "dynamic": self.dynamic.to_dict(include_api_key=include_secrets),
+            "export_provider": self.export_provider,
+            "export_supplier": self.export_supplier.to_dict(include_api_key=include_secrets),
             "last_updated_at": self.last_updated_at,
         }
 

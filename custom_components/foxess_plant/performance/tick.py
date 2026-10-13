@@ -143,6 +143,9 @@ async def async_performance_tick(coordinator: Any) -> None:
         "virtual_panel_temp_c": sample.virtual_panel_temp_c,
     }
     accumulate_bucket_financials(acc, bucket)
+    thermal = getattr(coordinator, "_panel_thermal", None)
+    if thermal is not None:
+        acc["panel_thermal"] = thermal.to_dict()
     if store is not None:
         try:
             store.save_day_state(local_date, acc)
@@ -289,6 +292,9 @@ async def _async_restore_day_state(coordinator: Any, store: PerformanceStore) ->
     if not saved:
         return
     saved_date, acc = saved
+    from .panel_thermal import PanelThermal
+
+    coordinator._panel_thermal = PanelThermal.from_dict(acc.get("panel_thermal"))
     today = dt_util.as_local(dt_util.now()).date().isoformat()
     if saved_date == today:
         coordinator._performance_day = saved_date

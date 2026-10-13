@@ -256,7 +256,45 @@ const DEFAULT_TARIFF = {
     email: "",
     export_from_api: true,
   },
+  // Who prices export (tariff_export.py): same | manual | entity | octopus | eon_next
+  export_provider: "same",
 };
+
+/** Import / Export provider pickers on the Tariff page. */
+const TARIFF_IMPORT_PROVIDERS = [
+  { id: "manual", label: "Manual Rates" },
+  { id: "entity", label: "Home Assistant Sensor" },
+  { id: "octopus", label: "Octopus" },
+  { id: "eon_next", label: "E.ON Next" },
+];
+
+/** Import provider id from a tariff (or draft): a supplier, a sensor, or the band schedule. */
+function tariffImportProviderId(tariffOrDraft) {
+  const supplier = tariffEnergyProviderId(tariffOrDraft);
+  if (supplier === "octopus" || supplier === "eon_next") return supplier;
+  return tariffOrDraft?.import_source === "entity" ? "entity" : "manual";
+}
+
+/** Export choices: "Same As Import" only with an import supplier, and that supplier isn't offered twice. */
+function tariffExportProviderOptions(importProvider) {
+  const supplier = importProvider === "octopus" || importProvider === "eon_next" ? importProvider : "";
+  const opts = [];
+  if (supplier) opts.push({ id: "same", label: `Same As Import (${energyProviderLabel(supplier)})` });
+  opts.push({ id: "manual", label: "Manual Rates" }, { id: "entity", label: "Home Assistant Sensor" });
+  for (const id of ["octopus", "eon_next"]) {
+    if (id !== supplier) opts.push({ id, label: energyProviderLabel(id) });
+  }
+  return opts;
+}
+
+/** Keep the export choice valid for the import provider (mirrors tariff_export.normalize_export_provider). */
+function normalizeTariffExportProvider(value, importProvider, exportSource) {
+  const supplier = importProvider === "octopus" || importProvider === "eon_next" ? importProvider : "";
+  let v = ["same", "manual", "entity", "octopus", "eon_next"].includes(value) ? value : supplier ? "same" : "manual";
+  if (v === supplier) v = "same";
+  if (v === "same" && !supplier) v = exportSource === "entity" ? "entity" : "manual";
+  return v;
+}
 
 /** Four schedule band colours (00:00–24:00 editor). */
 const TARIFF_BAND_COLORS = ["#43A047", "#1E88E5", "#FB8C00", "#E53935"];
@@ -400,7 +438,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.509";
+const PANEL_VERSION = "0.9.513";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -3616,7 +3654,10 @@ function performanceChartAxesSvg({ padL, padT, w, h, xDomain, xScale, yScale, yT
       return `<text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="statistics-axis-y">${esc(label)}${yUnit ? esc(yUnit) : ""}</text>`;
     })
     .join("");
-  const xTicks = forecastAccuracyXTicks(xDomain.tMin, xDomain.tMax, { maxTicks: 6 });
+  // A "07:00 AM" label needs ~70 px: on a phone six of them ran into each other
+  const xTicks = forecastAccuracyXTicks(xDomain.tMin, xDomain.tMax, {
+    maxTicks: Math.max(3, Math.min(6, Math.floor(w / 80))),
+  });
   const xLabels = xTicks
     .map((xt) => {
       const x = xScale(xt);
@@ -3830,8 +3871,13 @@ function renderPerformancePowerChartSvg(chart) {
   }
   const clipHatch = performanceClippingHatchSvg(pv, clip, xDomain, xScale, yScaleP);
   const hasClipping = performanceClipPoints(clip, xDomain.tMin, xDomain.tMax).some((p) => p.v > 0);
+  // The forecast SmartCharge was using: Solcast while fresh, else Open-Meteo (coral, as on the other charts)
+  const forecastSources = Array.isArray(chart?.pv_forecast_sources) ? chart.pv_forecast_sources : [];
+  const forecastColor =
+    forecastSources.length === 1 && forecastSources[0] === "Open-Meteo" ? OPEN_METEO_CHART_STYLE.color : "#f5c542";
+  const forecastLabel = forecastSources.length ? `PV Forecast (${forecastSources.join(", ")})` : "PV Forecast";
   const lines = [
-    { pts: potential, color: "#f5c542", width: 1.4, dash: "4 3" },
+    { pts: potential, color: forecastColor, width: 1.4, dash: "4 3" },
     { pts: pv, color: "#19D4DE", width: 2 },
     { pts: grid, color: "#2F6BFF", width: 1.8 },
     ...(hasClipping ? [{ pts: clip, color: "#ef4444", width: 1.4 }] : []),
@@ -3841,7 +3887,7 @@ function renderPerformancePowerChartSvg(chart) {
   const limitText = hasLimit ? ` (${acLimit.toFixed(1)} kW${limitOnScale ? "" : ", above this scale"})` : "";
   const legend = `<div class="fox-perf-chart-legend">
 <span><i style="background:#19D4DE"></i> Solar output kW</span>
-${potential.length ? `<span><i style="background:#f5c542"></i> PV Forecast</span>` : ""}
+${potential.length ? `<span><i style="background:${forecastColor}"></i> ${esc(forecastLabel)}</span>` : ""}
 <span><i style="background:#2F6BFF"></i> Net grid kW</span>
 ${hasLimit ? `<span><i style="background:#f59e0b"></i> Inverter AC limit${esc(limitText)}</span>` : ""}
 ${hasClipping ? `<span><i style="background:#ef4444"></i> Clipping kW</span>` : ""}
@@ -3870,7 +3916,7 @@ ${lines}
     tMax: xDomain.tMax,
     series: [
       { label: "Solar output", color: "#19D4DE", unit: " kW", points: pv },
-      ...(potential.length ? [{ label: "PV Forecast", color: "#f5c542", unit: " kW", points: potential }] : []),
+      ...(potential.length ? [{ label: "PV Forecast", color: forecastColor, unit: " kW", points: potential }] : []),
       { label: "Net grid", color: "#2F6BFF", unit: " kW", points: grid },
       ...(hasClipping ? [{ label: "Clipping", color: "#ef4444", unit: " kW", points: clip }] : []),
     ],
@@ -5064,12 +5110,11 @@ function octopusNativeManagesSchedule(tariff, octopusDraft) {
 
 /** True when native Octopus owns the plugin standing charge (Agile + fixed). */
 /** Import from a supplier API but export entered per band (e.g. Fused / fixed SEG). */
-function supplierExportManual(tariff, octopusDraft) {
+function supplierExportManual(tariff, octopusDraft, exportProvider) {
   if (!octopusNativeManagesSchedule(tariff, octopusDraft)) return false;
-  const draft = octopusDraft && typeof octopusDraft === "object" ? octopusDraft : {};
-  const dyn = tariff?.dynamic ?? {};
-  const fromApi = draft.export_from_api !== undefined ? draft.export_from_api : dyn.export_from_api;
-  if (fromApi === false) return true;
+  const provider = exportProvider ?? tariff?.export_provider;
+  if (provider === "manual") return true;
+  if (provider && provider !== "same") return false; // a sensor or another supplier prices export
   return Boolean(tariff?.octopus?.export_manual);
 }
 
@@ -5146,6 +5191,11 @@ function normalizeTariffDraft(raw) {
     apply_band_inverter_control: Boolean(t.apply_band_inverter_control),
     schedule,
     dynamic: normalizeOctopusDraft(t.dynamic, null),
+    export_provider: normalizeTariffExportProvider(
+      t.export_provider,
+      tariffImportProviderId(t),
+      normalizeTariffExportSource(t.export_source)
+    ),
   };
 }
 
@@ -5190,6 +5240,7 @@ function buildTariffSavePayload(draft) {
       email: normalized.dynamic?.email || null,
       export_from_api: normalized.dynamic?.export_from_api !== false,
     },
+    export_provider: normalized.export_provider,
   };
 }
 
@@ -11444,7 +11495,9 @@ function renderStatisticsChartHtml(series, range, options = {}) {
   const xLabels = xTicks
     .map((xt) => {
       const x = xScale(xt);
-      const anchor = narrow && xt === tMin ? "start" : "middle";
+      // Centred like the rest: a left-anchored first label ran into the second on phones ("12:00 AM06:00 AM").
+      // There's room: the 40 px left pad holds half a label.
+      const anchor = "middle";
       return `<text x="${x.toFixed(1)}" y="${height - pad.b + 20}" text-anchor="${anchor}" class="statistics-axis-x">${esc(formatChartTimeLabel(xt))}</text>`;
     })
     .join("");
@@ -17558,6 +17611,7 @@ Reloading panel registration…
 
   _enterTariffSettings() {
     this._initTariffDraft();
+    this._initExportSupplierDraft();
     this._tariffPickerMountGen += 1;
     this._octopusPickerMountGen += 1;
   }
@@ -17875,6 +17929,19 @@ Reloading panel registration…
       const value = this._tariffDraft[`${kind}_entity`] || "";
       if (picker.value !== value) picker.value = value || undefined;
     }
+  }
+
+  /** Pick the import supplier ("" for none): it stays off until that supplier's login is saved. */
+  _applyTariffSupplierChoice(provider) {
+    if (!this._tariffDraft.dynamic) this._tariffDraft.dynamic = { ...DEFAULT_TARIFF.dynamic };
+    const previous = this._tariffDraft.dynamic.provider || "";
+    this._tariffDraft.dynamic.provider = provider;
+    if (!provider || provider !== previous) this._tariffDraft.dynamic.enabled = false;
+    if (!this._octopusDraft) this._initOctopusDraft();
+    if (!provider || provider !== this._octopusDraft.provider) this._octopusDraft.enabled = false;
+    this._octopusDraft.provider = provider;
+    if (provider === "eon_next") this._octopusDraft.source = "native";
+    this._octopusPickerMountGen += 1;
   }
 
   _syncTariffEnergyProviderFromDom() {
@@ -19421,6 +19488,14 @@ Reloading panel registration…
       await this._saveTariffSettings();
       return;
     }
+    if (action === "save-tariff-export") {
+      await this._saveTariffExport();
+      return;
+    }
+    if (action === "test-export-supplier") {
+      await this._testExportSupplier();
+      return;
+    }
     if (action === "save-octopus-settings") {
       await this._saveOctopusSettings(false);
       return;
@@ -19838,6 +19913,33 @@ Reloading panel registration…
         if (kind === "currency") {
           this._tariffDraft.currency = normalizeTariffCurrency(el.value);
           this._scheduleRender();
+          return;
+        }
+        if (kind === "import_provider") {
+          // A supplier connects through its card; a sensor or the bands price import directly
+          const choice = el.value;
+          const supplier = choice === "octopus" || choice === "eon_next" ? choice : "";
+          this._applyTariffSupplierChoice(supplier);
+          this._tariffDraft.import_source = choice === "entity" ? "entity" : "schedule";
+          this._tariffDraft.export_provider = normalizeTariffExportProvider(
+            this._tariffDraft.export_provider,
+            tariffImportProviderId(this._tariffDraft),
+            this._tariffDraft.export_source
+          );
+          this._tariffDraft.export_source = this._tariffDraft.export_provider === "entity" ? "entity" : "schedule";
+          this._tariffPickerMountGen += 1;
+          this._scheduleRender();
+          void this._syncTariffEntityPickers();
+          void this._syncOctopusEntityPickers();
+          return;
+        }
+        if (kind === "export_provider") {
+          this._tariffDraft.export_provider = el.value;
+          this._tariffDraft.export_source = el.value === "entity" ? "entity" : "schedule";
+          this._exportSupplierMeters = null;
+          this._tariffPickerMountGen += 1;
+          this._scheduleRender();
+          void this._syncTariffEntityPickers();
           return;
         }
         if (kind === "energy_provider") {
@@ -25395,7 +25497,7 @@ ${this._renderPvStringBlock("pv2")}
         ? `<div class="field" data-tariff-manual="${esc(kind)}">
 <p class="field-hint">${
             standingApiLocked
-              ? `Synced from Octopus automatically whenever rates are fetched — published to the plugin sensor in ${esc(currency)}/day`
+              ? `Synced from ${esc(energyProviderLabel(tariffEnergyProviderId(this._tariffDraft)))} automatically whenever rates are fetched — published to the plugin sensor in ${esc(currency)}/day`
               : `Daily standing charge in ${esc(currency)} — published to the plugin sensor on save`
           }</p>
 <input type="number" min="0" max="9999" step="${esc(inputStep)}" inputmode="decimal" data-field="tariff:${esc(kind)}:p" value="${esc(String(manualDisplay || ""))}" placeholder="${esc(placeholder)}" ${standingInputDisabled ? "disabled readonly" : ""}>
@@ -25421,11 +25523,14 @@ ${standingManualBlock}
     if (!this._tariffDraft) this._initTariffDraft();
     const draft = this._tariffDraft;
     const showImport = normalizeTariffImportSource(draft.import_source) === "schedule";
-    const showExport = normalizeTariffExportSource(draft.export_source) === "schedule";
+    // Export from a sensor or another supplier isn't typed into the bands
+    const showExport =
+      normalizeTariffExportSource(draft.export_source) === "schedule" &&
+      (draft.export_provider === "manual" || draft.export_provider === "same");
     if (!showImport && !showExport) return "";
     const octopusLocked = octopusNativeManagesSchedule(this._plantState?.tariff, this._octopusDraft);
     const scheduleRatesDisabled = this._busy || octopusLocked;
-    const exportManual = supplierExportManual(this._plantState?.tariff, this._octopusDraft);
+    const exportManual = supplierExportManual(this._plantState?.tariff, this._octopusDraft, draft.export_provider);
     const exportRatesDisabled = this._busy || (octopusLocked && !exportManual);
     const supplierLabel = energyProviderLabel(tariffEnergyProviderId(this._plantState?.tariff));
     const smartChargeActive = smartChargeEnabled(this._plantState);
@@ -25483,13 +25588,13 @@ ${showExport ? `<div class="field" style="margin:0"><label>Export ${esc(currency
       ? `<p class="field-hint" style="margin:0 0 12px">Plugin sensors: ${[pluginIds.import, pluginIds.export].filter(Boolean).map((id) => esc(id)).join(" · ") || "—"} — rates update at each hour boundary so the recorder captures when costs change.</p>`
       : `<p class="field-hint" style="margin:0 0 12px">Plugin sensors are created when you save. They update at each hour boundary so the recorder captures when costs change (same path planned for Agile API tariffs).</p>`;
     const scheduleIntro = octopusLocked && exportManual
-      ? `Import rates and hour bands are synced from ${supplierLabel} automatically whenever rates are fetched. Export is from another supplier: type each band's export rate below and Save tariff — it is kept on every sync. Work Mode and Force Charge per band can still be configured.`
+      ? `Import rates and hour bands are synced from ${supplierLabel} automatically whenever rates are fetched. Export is Manual Rates: type each band's export rate below and Save Tariff — it is kept on every sync. Work Mode and Force Charge per band can still be configured.`
       : octopusLocked
       ? `Rates and hour bands are synced from ${supplierLabel} automatically whenever rates are fetched (including the 30-minute poll). Work Mode and Force Charge per band can still be configured below.`
       : "24 hourly blocks from 00:00 to 24:00, same every day. Pick a band colour, then tap hours to assign it. Use one band for a flat tariff, or two to four for peak/off-peak.";
     const cardLockClass = `${octopusLocked ? " tariff-schedule-locked" : ""}${smartChargeActive ? " tariff-band-inverter-locked" : ""}`;
     return `<div class="card tariff-schedule-card${cardLockClass}">
-<p class="card-title">Daily time-of-use schedule</p>
+<p class="card-title">Daily Time-of-Use Schedule</p>
 <p class="field-hint" style="margin:0 0 12px">${esc(scheduleIntro)}</p>
 <div class="toggle-row" style="margin:0 0 12px"><span>Apply band work mode to inverter</span><input type="checkbox" data-field="tariff:apply_band_inverter_control" ${bandControlChecked ? "checked" : ""} ${bandInverterDisabled ? "disabled" : ""}></div>
 <p class="field-hint" style="margin:0 0 12px">${esc(bandControlHint)}</p>
@@ -25529,64 +25634,256 @@ ${pluginHint}
     const scheduleStatus = live.schedule_status ?? {};
     const bandLabel =
       scheduleStatus.band_index != null ? TARIFF_BAND_LABELS[scheduleStatus.band_index] || "" : "";
-    return `<header class="header"><h1>Tariff</h1><p>Electricity rates for cost and revenue analysis. Use the daily schedule with plugin sensors (recorder-friendly), bind external Home Assistant sensors, or combine both.</p></header>
+    return `<header class="header"><h1>Tariff</h1><p>Electricity rates for cost and revenue analysis. Import and export can each come from a supplier, a Home Assistant sensor, or rates you type in — the same supplier for both, or different ones.</p></header>
 <div class="card">
-<p class="card-title">Electricity tariff</p>
+<p class="card-title">Electricity Tariff</p>
 <div class="field">
 <label>Currency</label>
 <select data-field="tariff:currency" ${this._busy ? "disabled" : ""}>${currencyOptions}</select>
 <p class="field-hint">Rates are stored in the selected currency. Changing currency does not convert existing values — re-enter rates after switching.</p>
 </div>
-${this._renderTariffRateBlock("import", {
-      label: "Import cost",
-      unitLabel: `${currency}/kWh`,
-      placeholder: currency === "GBP" ? "e.g. 0.245" : "e.g. 0.25",
-      liveMeta: entities.import,
-      pluginEntityId: pluginSensors.import,
-    })}
-${this._renderTariffRateBlock("export", {
-      label: "Export revenue",
-      unitLabel: `${currency}/kWh`,
-      placeholder: currency === "GBP" ? "e.g. 0.150" : "e.g. 0.15",
-      liveMeta: entities.export,
-      pluginEntityId: pluginSensors.export,
-    })}
 ${this._renderTariffScheduleEditor()}
 ${this._renderTariffRateBlock("standing", {
-      label: "Daily standing charge",
+      label: "Daily Standing Charge",
       unitLabel: `${currency}/day`,
       placeholder: currency === "GBP" ? "e.g. 0.53" : "e.g. 1.00",
       liveMeta: entities.standing,
       pluginEntityId: pluginSensors.standing,
     })}
-<div class="btn-row"><button type="button" class="btn btn-primary" data-action="save-tariff-settings" ${this._busy ? "disabled" : ""}>Save tariff</button></div>
+<div class="btn-row"><button type="button" class="btn btn-primary" data-action="save-tariff-settings" ${this._busy ? "disabled" : ""}>Save Tariff</button></div>
 </div>
-${this._renderEnergyProviderCard()}
-${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
-${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
 <div class="card">
 <p class="card-title">Status</p>
 <p style="margin:0 0 8px;font-size:14px">${live.configured ? "Tariff configured — ready for cost analysis." : "Not configured yet — save at least one rate above."}</p>
 ${effectiveBits.length ? `<p class="field-hint" style="margin:0 0 8px">Effective rates now: ${esc(effectiveBits.join(" · "))}${bandLabel ? ` · ${esc(bandLabel)} (hour ${scheduleStatus.hour ?? "—"})` : ""}</p>` : ""}
 <p class="field-hint" style="margin:0">Last saved: ${lastUpdated}${historyCount ? ` · ${esc(String(historyCount))} rate snapshot(s) recorded` : ""}</p>
+</div>
+${this._renderTariffImportCard(entities, currency)}
+${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
+${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
+${this._renderTariffExportCard(entities, currency)}`;
+  }
+
+  /** A Home Assistant sensor field for import / export price, with what it reads now. */
+  _renderTariffEntityField(kind, liveMeta, currency) {
+    const entityId = this._tariffDraft?.[`${kind}_entity`] || "";
+    let hint = "";
+    if (liveMeta?.available === false) {
+      hint = entityId ? `Sensor ${entityId} is unavailable` : "Choose a sensor that reports this rate";
+    } else if (liveMeta?.resolved_p != null) {
+      hint = `Live: ${formatTariffMoney(liveMeta.resolved_p, currency)}/kWh${liveMeta.entity_id ? ` from ${liveMeta.entity_id}` : ""}`;
+    } else if (entityId && liveMeta?.state != null) {
+      hint = `Live state: ${liveMeta.state}${liveMeta.unit ? ` ${liveMeta.unit}` : ""} — could not convert to ${currency} automatically`;
+    } else {
+      hint = tariffSuggestedEntitiesHint(this._hass, kind) || "Search by friendly name or entity id.";
+    }
+    return `<div class="field" data-tariff-entity="${esc(kind)}">
+<label>Sensor</label>
+<p class="field-hint">${esc(hint)}</p>
+<div class="tariff-entity-picker-host" data-tariff-picker="${esc(kind)}"></div>
 </div>`;
   }
 
-  _renderEnergyProviderCard() {
+  _renderTariffImportCard(entities, currency) {
     if (!this._tariffDraft) this._initTariffDraft();
-    const provider = tariffEnergyProviderId(this._tariffDraft);
-    const providerOptions = ENERGY_TARIFF_PROVIDERS.map(
-      ({ id, label }) =>
-        `<option value="${esc(id)}" ${provider === id ? "selected" : ""}>${esc(label)}</option>`
+    const provider = tariffImportProviderId(this._tariffDraft);
+    const options = TARIFF_IMPORT_PROVIDERS.map(
+      ({ id, label }) => `<option value="${esc(id)}" ${provider === id ? "selected" : ""}>${esc(label)}</option>`
     ).join("");
+    const hint =
+      provider === "manual"
+        ? "Type import rates per band in the Daily Time-of-Use Schedule above."
+        : provider === "entity"
+          ? "A sensor that reports your import price — or an Octopus Energy integration rate sensor, whose upcoming rates SmartCharge also plans with."
+          : `Connect your ${energyProviderLabel(provider)} account below: import rates and hour bands sync automatically.`;
     return `<div class="card">
-<p class="card-title">Energy provider</p>
+<p class="card-title">Import</p>
 <div class="field">
 <label>Provider</label>
-<select data-field="tariff:energy_provider" ${this._busy ? "disabled" : ""}>${providerOptions}</select>
-<p class="field-hint" style="margin:4px 0 0">Connect live supplier rates to your tariff (Octopus or E.ON Next) — choose None to enter rates manually above.</p>
+<select data-field="tariff:import_provider" ${this._busy ? "disabled" : ""}>${options}</select>
+<p class="field-hint" style="margin:4px 0 0">${esc(hint)}</p>
 </div>
+${provider === "entity" ? this._renderTariffEntityField("import", entities.import, currency) : ""}
 </div>`;
+  }
+
+  _renderTariffExportCard(entities, currency) {
+    if (!this._tariffDraft) this._initTariffDraft();
+    if (!this._exportSupplierDraft) this._initExportSupplierDraft();
+    const importProvider = tariffImportProviderId(this._tariffDraft);
+    const provider = normalizeTariffExportProvider(
+      this._tariffDraft.export_provider,
+      importProvider,
+      this._tariffDraft.export_source
+    );
+    const live = this._plantState?.tariff?.export ?? {};
+    const savedProvider = this._plantState?.tariff?.export_provider;
+    const busy = this._busy ? "disabled" : "";
+    const options = tariffExportProviderOptions(importProvider)
+      .map(({ id, label }) => `<option value="${esc(id)}" ${provider === id ? "selected" : ""}>${esc(label)}</option>`)
+      .join("");
+    const supplier = provider === "octopus" || provider === "eon_next";
+    const hint =
+      provider === "same"
+        ? `Export rates come from the export meter on your ${energyProviderLabel(importProvider)} account.`
+        : provider === "manual"
+          ? "Type export rates per band in the Daily Time-of-Use Schedule above — e.g. a fixed SEG rate."
+          : provider === "entity"
+            ? "A sensor that reports your export price (its upcoming rates too, if it lists them)."
+            : `Export from a different supplier than import: sign in to ${energyProviderLabel(provider)} here. Only its export meter is used.`;
+    const statusLines = [];
+    if (savedProvider === provider && provider !== "same") {
+      if (live.export_tariff_code) statusLines.push(`Export tariff: ${live.export_tariff_code}`);
+      if (live.current_export_p_per_kwh != null) {
+        statusLines.push(`Current: ${formatTariffMoney(live.current_export_p_per_kwh, currency)}/kWh`);
+      }
+      if (supplier) {
+        statusLines.push(`Last fetch: ${live.last_fetch_at ? formatSolcastTimestamp(live.last_fetch_at) : "Never"}`);
+        if (live.last_error) statusLines.push(`Error: ${live.last_error}`);
+      }
+    } else if (savedProvider !== provider) {
+      statusLines.push("Not saved yet — press Save Export.");
+    }
+    return `<div class="card">
+<p class="card-title">Export</p>
+<div class="field">
+<label>Provider</label>
+<select data-field="tariff:export_provider" ${busy}>${options}</select>
+<p class="field-hint" style="margin:4px 0 0">${esc(hint)}</p>
+</div>
+${provider === "entity" ? this._renderTariffEntityField("export", entities.export, currency) : ""}
+${supplier ? this._renderExportSupplierFields(provider, live) : ""}
+<div class="btn-row">
+${supplier ? `<button type="button" class="btn btn-secondary" data-action="test-export-supplier" ${busy}>Test Connection</button>` : ""}
+<button type="button" class="btn btn-primary" data-action="save-tariff-export" ${busy}>Save Export</button>
+</div>
+${statusLines.length ? `<p class="field-hint" style="margin:12px 0 0">${statusLines.map((l) => esc(l)).join("<br>")}</p>` : ""}
+</div>`;
+  }
+
+  /** Login for an export-only supplier (import is elsewhere). */
+  _renderExportSupplierFields(provider, live) {
+    const d = this._exportSupplierDraft;
+    const busy = this._busy ? "disabled" : "";
+    const meters = (this._exportSupplierMeters ?? live.export_meters ?? []).filter(Boolean);
+    const meterField = meters.length
+      ? `<div class="field"><label>Export MPAN</label><select data-field="export_supplier:export_mpan" ${busy}><option value="">Auto</option>${meters
+          .map(
+            (m) =>
+              `<option value="${esc(m.mpan)}" ${d.export_mpan === m.mpan ? "selected" : ""}>${esc(m.display_name || m.mpan)}${m.tariff_code ? ` · ${esc(m.tariff_code)}` : ""}</option>`
+          )
+          .join("")}</select></div>`
+      : "";
+    if (provider === "octopus") {
+      return `<div class="field"><label>API Key</label>
+<input type="password" autocomplete="off" data-field="export_supplier:api_key" value="${esc(String(d.api_key || ""))}" placeholder="${esc(d.api_key_set ? "••••••••  (leave blank to keep)" : "Paste Octopus API key")}" ${busy}>
+<p class="field-hint">From your <a class="field-link" href="${esc(OCTOPUS_API_DOCS_URL)}" target="_blank" rel="noopener noreferrer">Octopus dashboard</a> (Developer settings → API access).</p>
+</div>
+<div class="field"><label>Account Number</label>
+<input type="text" data-field="export_supplier:account_number" value="${esc(String(d.account_number || ""))}" placeholder="A-12345678" ${busy}>
+</div>
+${meterField}`;
+    }
+    return `<div class="field"><label>Sign-In Token</label>
+<input type="password" autocomplete="off" data-field="export_supplier:refresh_token" value="${esc(String(d.refresh_token || ""))}" placeholder="${esc(d.refresh_token_set ? "••••••••  (saved — paste a new one only if asked)" : "Paste sign-in token")}" ${busy}>
+<p class="field-hint">On a computer, sign in at <a class="field-link" href="https://www.eonnext.com/dashboard" target="_blank" rel="noopener noreferrer">eonnext.com</a>, <button type="button" class="btn btn-secondary" style="padding:2px 8px;min-height:0" data-action="copy-eon-next-snippet" ${busy}>Copy Snippet</button>, press F12 → Console, paste it and press Enter, then paste the token here.</p>
+</div>
+<div class="field"><label>Account Number (Optional)</label>
+<input type="text" data-field="export_supplier:account_number" value="${esc(String(d.account_number || ""))}" placeholder="Auto — every account on this login" ${busy}>
+</div>
+${meterField}`;
+  }
+
+  _initExportSupplierDraft() {
+    const sup = this._plantState?.tariff?.export_supplier ?? {};
+    this._exportSupplierDraft = {
+      api_key: "",
+      api_key_set: Boolean(sup.api_key_set),
+      account_number: sup.account_number || "",
+      export_mpan: sup.export_mpan || "",
+      refresh_token: "",
+      refresh_token_set: Boolean(sup.refresh_token_set),
+    };
+    this._exportSupplierMeters = null;
+  }
+
+  _syncExportSupplierDraftFromDom() {
+    if (!this._exportSupplierDraft) this._initExportSupplierDraft();
+    const d = this._exportSupplierDraft;
+    for (const key of ["api_key", "account_number", "export_mpan", "refresh_token"]) {
+      const el = this._root.querySelector(`[data-field="export_supplier:${key}"]`);
+      if (el) d[key] = String(el.value || "").trim();
+    }
+  }
+
+  _exportSupplierPayload() {
+    this._syncExportSupplierDraftFromDom();
+    this._syncTariffDraftFromPickers();
+    const d = this._exportSupplierDraft;
+    const provider = this._tariffDraft.export_provider;
+    const payload = { provider };
+    if (provider === "octopus" || provider === "eon_next") {
+      payload.account_number = d.account_number || null;
+      payload.export_mpan = d.export_mpan || null;
+      if (d.api_key) payload.api_key = d.api_key;
+      if (d.refresh_token) payload.refresh_token = d.refresh_token;
+    }
+    if (provider === "entity") payload.export_entity = this._tariffDraft.export_entity || null;
+    return payload;
+  }
+
+  async _saveTariffExport() {
+    const plant = this._getPlant();
+    if (!plant || !this._tariffDraft) return;
+    const payload = this._exportSupplierPayload();
+    if (payload.provider === "entity" && !payload.export_entity) {
+      this._showToast("Choose the export price sensor", "err");
+      return;
+    }
+    this._busy = true;
+    this._render();
+    try {
+      const state = await this._hass.connection.sendMessagePromise({
+        type: "foxess_plant/update_export_supplier",
+        plant_id: plant.entry_id,
+        export: payload,
+      });
+      if (state) this._plantState = state;
+      this._initExportSupplierDraft();
+      this._initTariffDraft();
+      const err = this._plantState?.tariff?.export?.last_error;
+      this._showToast(err ? `Export saved, but the fetch failed: ${err}` : "Export saved", err ? "err" : undefined);
+    } catch (err) {
+      this._showToast(tariffSaveErrorMessage(err), "err");
+      console.error("FoxESS Plant: export save failed", err);
+    } finally {
+      this._busy = false;
+      this._render();
+    }
+  }
+
+  async _testExportSupplier() {
+    const plant = this._getPlant();
+    if (!plant || !this._tariffDraft) return;
+    const payload = this._exportSupplierPayload();
+    this._busy = true;
+    this._render();
+    try {
+      const result = await this._hass.connection.sendMessagePromise({
+        type: "foxess_plant/test_export_supplier",
+        plant_id: plant.entry_id,
+        export: payload,
+      });
+      this._exportSupplierMeters = result?.export_meters ?? null;
+      this._showToast(
+        `Connected — export tariff ${result?.export_tariff_code || "found"}, ${result?.rates_count ?? 0} rates. Press Save Export to use it.`
+      );
+    } catch (err) {
+      this._showToast(tariffSaveErrorMessage(err), "err");
+    } finally {
+      this._busy = false;
+      this._render();
+    }
   }
 
   _renderSettingsFoxApi(plant) {
@@ -25601,7 +25898,7 @@ ${this._renderFoxApiCredentials()}`;
     const keyPlaceholder = draft.api_key_set ? "••••••••  (leave blank to keep)" : "Paste Fox Cloud API key";
     const sn = live.device_sn || this._plantState?.battery_warmup?.device_sn || this._plantState?.identity?.pcs_serial_number || "";
     const detailBlock = draft.enabled
-      ? `<div class="field"><label>API key</label>
+      ? `<div class="field"><label>API Key</label>
 <input type="password" autocomplete="off" data-field="fox:api_key" value="${esc(String(draft.api_key || ""))}" placeholder="${esc(keyPlaceholder)}" ${this._busy ? "disabled" : ""}>
 <p class="field-hint">Create a key in the <a class="field-link" href="${esc(FOX_CLOUD_API_DOCS_URL)}" target="_blank" rel="noopener noreferrer">FoxESS Cloud Open API</a> portal (API management).</p>
 </div>
@@ -25611,7 +25908,7 @@ ${this._renderFoxApiCredentials()}`;
 </div>
 <div class="btn-row">
 <button type="button" class="btn btn-primary" data-action="save-fox-cloud" ${this._busy ? "disabled" : ""}>Save Fox Cloud</button>
-<button type="button" class="btn btn-secondary" data-action="test-fox-cloud" ${this._busy ? "disabled" : ""}>Test connection</button>
+<button type="button" class="btn btn-secondary" data-action="test-fox-cloud" ${this._busy ? "disabled" : ""}>Test Connection</button>
 </div>
 ${live.last_error ? `<p class="field-hint" style="margin-top:8px;color:var(--fp-amber)">Last error: ${esc(String(live.last_error))}</p>` : ""}`
       : "";
@@ -25771,7 +26068,7 @@ ${tile("Low-price slots", slots.length ? String(slots.length) : "None")}
     const draft = this._solcastDraft;
     const keyPlaceholder = draft.api_key_set ? "••••••••  (leave blank to keep)" : "Paste Solcast API key";
     const detailBlock = draft.enabled
-      ? `<div class="field"><label>API key</label>
+      ? `<div class="field"><label>API Key</label>
 <input type="password" autocomplete="off" data-field="solcast:api_key" value="${esc(String(draft.api_key || ""))}" placeholder="${esc(keyPlaceholder)}" ${this._busy ? "disabled" : ""}></div>
 <div class="field"><label>API limit (requests per day)</label>
 <p class="field-hint">Hobbyist plans are typically 10/day — used to spread automatic polling.</p>
@@ -25846,7 +26143,7 @@ ${detailBlock}
     statusLines.push(`Last fetch: ${lastFetch}`);
     if (lastErr) statusLines.push(`Error: ${lastErr}`);
     const exportMpanField =
-      draft.export_from_api === false
+      this._tariffDraft?.export_provider !== "same"
         ? ""
         : exportMeters.length > 0
         ? `<div class="field"><label>Export MPAN (SEG / Outgoing)</label><select data-field="octopus:export_mpan" ${this._busy ? "disabled" : ""}><option value="">Auto (${esc((exportMeters[0] && (exportMeters[0].display_name || exportMeters[0].mpan)) || "first")})</option>${exportOptions}</select>
@@ -25856,29 +26153,28 @@ ${detailBlock}
           : "";
     const entityBlock =
       draft.source === "entity"
-        ? `<div class="field"><label>External import rate sensor</label>
+        ? `<div class="field"><label>External Import Rate Sensor</label>
 <div class="tariff-entity-picker-host" data-octopus-picker="import"></div>
 </div>
-<div class="field"><label>External export rate sensor</label>
+<div class="field"><label>External Export Rate Sensor</label>
 <div class="tariff-entity-picker-host" data-octopus-picker="export"></div>
 <p class="field-hint">Use this if you already run the official <code>octopus_energy</code> integration — Fox Plant reads those entities instead of polling Octopus directly.</p>
 </div>`
-        : `<div class="field"><label>API key</label>
+        : `<div class="field"><label>API Key</label>
 <input type="password" autocomplete="off" data-field="octopus:api_key" value="${esc(String(draft.api_key || ""))}" placeholder="${esc(keyPlaceholder)}" ${this._busy ? "disabled" : ""}>
 <p class="field-hint">Create a key in your <a class="field-link" href="${esc(OCTOPUS_API_DOCS_URL)}" target="_blank" rel="noopener noreferrer">Octopus dashboard</a> (Developer settings → API access).</p>
 </div>
-<div class="field"><label>Account number</label>
+<div class="field"><label>Account Number</label>
 <input type="text" data-field="octopus:account_number" value="${esc(String(draft.account_number || ""))}" placeholder="A-12345678" ${this._busy ? "disabled" : ""}>
 </div>
 ${importMeters.length > 1 ? `<div class="field"><label>Import MPAN</label><select data-field="octopus:import_mpan" ${this._busy ? "disabled" : ""}><option value="">Select meter…</option>${importOptions}</select></div>` : ""}
-${this._renderSupplierExportSourceField("Octopus")}
 ${exportMpanField}`;
     const scheduleAutoHint =
       native && draft.enabled && connected && !agile
         ? "Fixed tariffs update the daily schedule automatically when rates are fetched."
         : "";
     const detailBlock = draft.enabled
-      ? `<div class="field"><label>Rate source</label>
+      ? `<div class="field"><label>Rate Source</label>
 <select data-field="octopus:source" ${this._busy ? "disabled" : ""}>
 <option value="native" ${native ? "selected" : ""}>Native API (recommended)</option>
 <option value="entity" ${!native ? "selected" : ""}>External Home Assistant sensors</option>
@@ -25886,8 +26182,8 @@ ${exportMpanField}`;
 </div>
 ${entityBlock}
 <div class="btn-row">
-<button type="button" class="btn btn-secondary" data-action="test-octopus" ${this._busy || !native ? "disabled" : ""}>Test connection</button>
-<button type="button" class="btn btn-secondary" data-action="fetch-octopus" ${this._busy || !native ? "disabled" : ""}>Fetch rates now</button>
+<button type="button" class="btn btn-secondary" data-action="test-octopus" ${this._busy || !native ? "disabled" : ""}>Test Connection</button>
+<button type="button" class="btn btn-secondary" data-action="fetch-octopus" ${this._busy || !native ? "disabled" : ""}>Fetch Rates Now</button>
 <button type="button" class="btn btn-primary" data-action="save-octopus-settings" ${this._busy ? "disabled" : ""}>Save Octopus</button>
 </div>
 ${statusLines.length ? `<p class="field-hint" style="margin:12px 0 0">${statusLines.map((l) => esc(l)).join("<br>")}</p>` : ""}`
@@ -25895,20 +26191,9 @@ ${statusLines.length ? `<p class="field-hint" style="margin:12px 0 0">${statusLi
     return `<div class="card">
 <p class="card-title">Octopus Energy</p>
 <p class="field-hint" style="margin:0 0 12px">Native Octopus polling for Go, Economy 7, flat SVT, and Agile. ${scheduleAutoHint || "Fixed tariffs sync the 24-hour schedule on fetch; Agile updates plugin import/export sensors every 30 minutes (including negative rates)."}</p>
-<div class="toggle-row"><span><strong>Enable Octopus tariff link</strong></span>
+<div class="toggle-row"><span><strong>Enable Octopus Tariff Link</strong></span>
 <input type="checkbox" data-field="octopus:enabled" ${draft.enabled ? "checked" : ""} ${this._busy ? "disabled" : ""}></div>
 ${detailBlock}
-</div>`;
-  }
-
-  _renderSupplierExportSourceField(label) {
-    const manual = this._octopusDraft?.export_from_api === false;
-    return `<div class="field"><label>Export rates from</label>
-<select data-field="octopus:export_from_api" ${this._busy ? "disabled" : ""}>
-<option value="api" ${manual ? "" : "selected"}>${esc(label)} API</option>
-<option value="manual" ${manual ? "selected" : ""}>Manual — another supplier (e.g. Fused, fixed SEG)</option>
-</select>
-<p class="field-hint">Manual keeps import live from ${esc(label)} and lets you type export per band in the daily schedule below. It is used automatically if ${esc(label)} returns no export rates.</p>
 </div>`;
   }
 
@@ -25980,12 +26265,12 @@ ${detailBlock}
       ? "••••••••  (saved — paste a new one only if asked)"
       : "Paste sign-in token";
     const detailBlock = draft.enabled
-      ? `<div class="field"><label>Sign-in token</label>
+      ? `<div class="field"><label>Sign-In Token</label>
 <input type="password" autocomplete="off" data-field="octopus:refresh_token" value="${esc(String(draft.refresh_token || ""))}" placeholder="${esc(tokenPlaceholder)}" ${busy}>
 <p class="field-hint">E.ON Next has no API keys and blocks password sign-in from integrations, so Fox Plant keeps itself signed in with a token from your browser (one-off):</p>
 <ol class="field-hint" style="margin:4px 0 8px;padding-left:20px">
 <li>On a computer, sign in at <a class="field-link" href="https://www.eonnext.com/dashboard" target="_blank" rel="noopener noreferrer">eonnext.com</a>.</li>
-<li><button type="button" class="btn btn-secondary" style="padding:2px 8px;min-height:0" data-action="copy-eon-next-snippet" ${busy}>Copy snippet</button>, press F12 → Console, paste it and press Enter (Chrome may ask you to type <code>allow pasting</code> first).</li>
+<li><button type="button" class="btn btn-secondary" style="padding:2px 8px;min-height:0" data-action="copy-eon-next-snippet" ${busy}>Copy Snippet</button>, press F12 → Console, paste it and press Enter (Chrome may ask you to type <code>allow pasting</code> first).</li>
 <li>It copies your token and signs that browser tab out locally — close the tab, then paste here and Save. Signing in again on the website later is fine.</li>
 </ol>
 <p class="field-hint">Fox Plant renews the token itself and survives restarts. If E.ON ever rejects it, the error below will ask for a fresh one.</p>
@@ -25999,16 +26284,15 @@ ${detailBlock}
 <p class="field-hint">Only for accounts not yet moved to E.ON's new sign-in. Moved accounts get "Invalid data (KT-CT-1138)" here — use the sign-in token instead.</p>
 </div>
 </details>
-<div class="field"><label>Account number (optional)</label>
+<div class="field"><label>Account Number (Optional)</label>
 <input type="text" data-field="octopus:account_number" value="${esc(String(draft.account_number || ""))}" placeholder="Auto — every account on this login" ${busy}>
 <p class="field-hint">Leave blank to use every account on the login. E.ON can put an export meter on its own account.</p>
 </div>
 ${importMeters.length > 1 ? `<div class="field"><label>Import MPAN</label><select data-field="octopus:import_mpan" ${busy}><option value="">Select meter…</option>${meterOptions(importMeters, draft.import_mpan)}</select></div>` : ""}
-${this._renderSupplierExportSourceField("E.ON Next")}
-${exportMeters.length > 0 && draft.export_from_api !== false ? `<div class="field"><label>Export MPAN</label><select data-field="octopus:export_mpan" ${busy}><option value="">Auto</option>${meterOptions(exportMeters, draft.export_mpan)}</select></div>` : ""}
+${exportMeters.length > 0 && this._tariffDraft?.export_provider === "same" ? `<div class="field"><label>Export MPAN</label><select data-field="octopus:export_mpan" ${busy}><option value="">Auto</option>${meterOptions(exportMeters, draft.export_mpan)}</select></div>` : ""}
 <div class="btn-row">
-<button type="button" class="btn btn-secondary" data-action="test-octopus" ${busy}>Test connection</button>
-<button type="button" class="btn btn-secondary" data-action="fetch-octopus" ${busy}>Fetch rates now</button>
+<button type="button" class="btn btn-secondary" data-action="test-octopus" ${busy}>Test Connection</button>
+<button type="button" class="btn btn-secondary" data-action="fetch-octopus" ${busy}>Fetch Rates Now</button>
 <button type="button" class="btn btn-primary" data-action="save-octopus-settings" ${busy}>Save E.ON Next</button>
 </div>
 <p class="field-hint" style="margin:12px 0 0">${statusLines.map((l) => esc(l)).join("<br>")}</p>`
@@ -26016,7 +26300,7 @@ ${exportMeters.length > 0 && draft.export_from_api !== false ? `<div class="fiel
     return `<div class="card">
 <p class="card-title">E.ON Next</p>
 <p class="field-hint" style="margin:0 0 12px">Native E.ON Next polling for fixed, flexible, Economy 7 and Next Drive time-of-use tariffs. Rates sync the 24-hour schedule on each hourly fetch, and SmartCharge plans against them. Octopus-only extras (Greener Nights, Energy Analysis) are not available.</p>
-<div class="toggle-row"><span><strong>Enable E.ON Next tariff link</strong></span>
+<div class="toggle-row"><span><strong>Enable E.ON Next Tariff Link</strong></span>
 <input type="checkbox" data-field="octopus:enabled" ${draft.enabled ? "checked" : ""} ${busy}></div>
 ${detailBlock}
 </div>`;
@@ -26261,7 +26545,7 @@ ${this._renderSolcastRequestLog(live)}
 </div>
 <div class="btn-row">
 <button type="button" class="btn btn-primary" data-action="save-solcast-settings" ${this._busy ? "disabled" : ""}>Save</button>
-<button type="button" class="btn btn-secondary" data-action="test-solcast" ${this._busy ? "disabled" : ""}>Test connection</button>
+<button type="button" class="btn btn-secondary" data-action="test-solcast" ${this._busy ? "disabled" : ""}>Test Connection</button>
 <p class="field-hint" style="margin-top:10px">Test lists your <strong>Home PV systems</strong> from the Solcast toolkit (does not use your daily forecast quota).</p>
 </div>`;
   }

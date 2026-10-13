@@ -74,6 +74,13 @@ def _stub_sub(mod_name: str, **attrs):
 
 
 _install_ha_stubs()
+# The stubs only need to exist while octopus_analysis loads. Put the real modules back afterwards, otherwise later
+# tests in the same run import the stubs (test_tariff_export got a stub octopus_tariff with no OctopusMeterSummary).
+_STUBBED = [
+    f"{PKG_NAME}.{name}"
+    for name in ("octopus_greener", "octopus_api", "octopus_consumption_store", "octopus_tariff")
+]
+_saved_modules = {name: sys.modules.get(name) for name in _STUBBED}
 _stub_sub(
     "octopus_greener",
     GREEN_THRESHOLD_GCO2=GREEN_THRESHOLD_GCO2,
@@ -103,6 +110,12 @@ _spec = importlib.util.spec_from_file_location(
 oa = importlib.util.module_from_spec(_spec)
 sys.modules[f"{PKG_NAME}.octopus_analysis"] = oa
 _spec.loader.exec_module(oa)
+for _name, _module in _saved_modules.items():
+    if _module is None:
+        sys.modules.pop(_name, None)
+    else:
+        sys.modules[_name] = _module
+sys.modules.pop(f"{PKG_NAME}.octopus_analysis", None)  # built against the stubs: don't let others reuse it
 
 
 class TestMergePriceAndCarbon(unittest.TestCase):

@@ -172,6 +172,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._unsub_pv_efficiency: callable | None = None
         self._last_tariff_sensor_rates: dict[str, float] = {}
         self._octopus_cache: dict[str, Any] = {}
+        # Export from a different supplier than import (tariff_export.py): its rates, fetch/attempt times, errors.
+        # Saved in .storage so a restart reuses it instead of calling the supplier again.
+        self._export_supplier_cache: dict[str, Any] = {}
+        self._export_supplier_store: Any = None
+        self._unsub_export_supplier: Any = None
         # Reused across polls so E.ON Next refreshes its Kraken token instead of logging in each hour.
         self._eon_next_client: Any = None
         self._eon_next_client_key: tuple[str, str, str] | None = None
@@ -197,6 +202,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._performance_day: str = ""
         self._performance_daily: dict[str, Any] = {}
         self._unsub_performance: callable | None = None
+        # Panel temperature with thermal lag (performance/panel_thermal.py), stepped every 30 s, saved per tick
+        from .performance.panel_thermal import PanelThermal
+
+        self._panel_thermal = PanelThermal()
+        self._unsub_panel_thermal: callable | None = None
         self._battery_warmup_live: dict[str, Any] = {}
         # A warm-up save Fox Cloud hasn't confirmed yet ({"saved": settings, "since": UTC}), a re-check timer, and
         # the message when it never did
@@ -549,6 +559,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for kind in ("import", "export", "standing")
         }
         state["octopus"] = self._octopus_status()
+        state["export"] = self._export_status()
         # Drives the Octopus Energy Analysis report, which only exists for Octopus.
         state["octopus_api_active"] = self._octopus_native_active() and self._octopus_greener_enabled()
         state["octopus_greener"] = self._octopus_greener_state()
@@ -856,6 +867,14 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 updates["export"] = (float(scheduled.get("export_p_per_kwh") or 0), band_index)
             else:
                 updates["export"] = (None, None)
+        # Export priced apart from import (a sensor or another supplier): its own current rate
+        override = self._export_override_rows()
+        if override:
+            from homeassistant.util import dt as dt_util
+
+            from .octopus_tariff import rate_at
+
+            updates["export"] = (rate_at(dt_util.utcnow(), override), None)
 
         if tariff.standing_source == TARIFF_SOURCE_PLUGIN:
             # Prefer live Octopus standing when native rates are loaded (Agile included).
@@ -937,6 +956,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_octopus_tick(self) -> None:
         await self._async_refresh_octopus()
+        self._apply_manual_export_to_cache()  # an Export sensor's price may have moved since the last fetch
         self._sync_octopus_current_rates_from_cache()
         self._setup_octopus_timer()
         if self._octopus_agile_active():
@@ -1244,6 +1264,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_save_smart_charge_pv()
         await self._async_load_tariff_storage()
         await self._async_restore_supplier_tariff()
+        await self._async_load_export_supplier()
         self._sync_trigger_membership()
         self.setup_trigger_listeners()
         await super().async_config_entry_first_refresh()
@@ -1256,6 +1277,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._setup_octopus_timer()
         self._setup_octopus_greener_timer()
         self._setup_octopus_consumption_timer()
+        self._setup_export_supplier_timer()
         self._setup_glow_mqtt()
         self._setup_smart_charge_timer()
         self._setup_smart_charge_daily_plan_timer()
@@ -2030,8 +2052,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         last = dt_util.parse_datetime(raw) if raw else None
         return last is None or dt_util.utcnow() - last >= every
 
-    async def _async_refresh_open_meteo(self, *, force: bool = False) -> None:
-        """Fetch the forecast hourly and re-score the models twice a day (both only when enabled)."""
+    async def _async_refresh_open_meteo(self, *, force: bool = False, rescore: bool = False) -> None:
+        """Fetch the forecast hourly and re-score the models twice a day (both only when enabled).
+
+        ``force`` refetches the forecast now; ``rescore`` re-scores now (only needed when the models change).
+        """
         from homeassistant.helpers.aiohttp_client import async_get_clientsession
         from homeassistant.util import dt as dt_util
 
@@ -2063,7 +2088,12 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         forecast=forecast, fetched_at=dt_util.utcnow().isoformat(), last_error=None
                     )
                     changed = True
-            if force or self._open_meteo_due("scored_at", om.SCORE_REFRESH):
+            # A failed scoring run waits an hour too (it used to retry on every 10-minute tick)
+            if rescore or (
+                self._open_meteo_due("scored_at", om.SCORE_REFRESH)
+                and self._open_meteo_due("score_attempt_at", om.FORECAST_REFRESH)
+            ):
+                self._open_meteo_cache["score_attempt_at"] = dt_util.utcnow().isoformat()
                 tz = local_tz()
                 today = dt_util.now().date()
                 start = today - timedelta(days=om.SCORE_DAYS)
@@ -2240,19 +2270,20 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 kw = float(sc["pv_power_now_kw"])
             today = sc.get("forecast_today_kwh")
             return kw, float(today) if today is not None else None
+        from .open_meteo import chart_points
+        from .pv_forecast_line import interpolate_now
+
         now = dt_util.utcnow()
         today_local = dt_util.now().date()
-        kw_now = None
+        rows = self._open_meteo_rows()
         today_kwh = 0.0
-        for row in self._open_meteo_rows():
+        for row in rows:
             end = _row_end(row)
-            if end is None:
-                continue
-            if end - HALF_HOUR <= now < end:
-                kw_now = float(row["pv_estimate"])
-            if dt_util.as_local(end - HALF_HOUR).date() == today_local:
+            if end is not None and dt_util.as_local(end - HALF_HOUR).date() == today_local:
                 today_kwh += float(row["pv_estimate"]) * 0.5
-        return kw_now, round(today_kwh, 2)
+        # Between the hourly mid-points, not the hour's flat value (that stepped the clipping and panel temperature)
+        kw_now = interpolate_now(chart_points(rows), now.timestamp() * 1000)
+        return (round(kw_now, 3) if kw_now is not None else None), round(today_kwh, 2)
 
     def _solcast_fresh(self) -> bool:
         from homeassistant.util import dt as dt_util
@@ -2322,13 +2353,18 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_save_open_meteo(self, *, open_meteo: dict[str, Any]) -> None:
         from .models import OpenMeteoConfig
 
+        before = set(self.plant.open_meteo.models)
         merged = {**self.plant.open_meteo.to_dict(), **open_meteo}
         data = dict(self.config_entry.data)
         data["open_meteo"] = OpenMeteoConfig.from_dict(merged).to_dict()
         self.hass.config_entries.async_update_entry(self.config_entry, data=data)
         self.update_plant_config(PlantConfig.from_entry_data(data))
         if self.plant.open_meteo.enabled:
-            await self._async_refresh_open_meteo(force=True)
+            # Scoring pulls 30 days for every model: only redo it now when the models changed
+            unscored = set(self.plant.open_meteo.models) - set(self._open_meteo_cache.get("scores") or {})
+            await self._async_refresh_open_meteo(
+                force=True, rescore=set(self.plant.open_meteo.models) != before and bool(unscored)
+            )
         await self.async_request_refresh()
 
     async def _async_refresh_storm_weather(self) -> None:
@@ -2590,7 +2626,16 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return max(0.0, abs(load_w) / 1000.0)
 
     def _smart_charge_rate_rows(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Import / export rate rows (Octopus API shape) for the planner timeline."""
+        """Import / export rate rows (Octopus API shape) for the planner timeline.
+
+        Export priced apart from import (a sensor or another supplier, tariff_export.py) replaces the export rows
+        whatever import uses.
+        """
+        import_rows, export_rows = self._smart_charge_import_based_rate_rows()
+        override = self._export_override_rows()
+        return import_rows, (override if override is not None else export_rows)
+
+    def _smart_charge_import_based_rate_rows(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if self._octopus_agile_active() or (
             not self._octopus_entity_active() and self._octopus_cache.get("import_rates")
         ):
@@ -3817,9 +3862,14 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Performance store init failed: %s", err)
 
     def _setup_performance_timer(self) -> None:
+        from .performance.panel_thermal import STEP_INTERVAL
+
         if self._unsub_performance:
             self._unsub_performance()
             self._unsub_performance = None
+        if self._unsub_panel_thermal:
+            self._unsub_panel_thermal()
+            self._unsub_panel_thermal = None
         if not self.plant.performance.enabled:
             return
         self._unsub_performance = async_track_time_interval(
@@ -3827,10 +3877,22 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._performance_timer_callback,
             timedelta(minutes=5),
         )
+        self._unsub_panel_thermal = async_track_time_interval(
+            self.hass, self._panel_thermal_callback, STEP_INTERVAL
+        )
 
     @callback
     def _performance_timer_callback(self, _now) -> None:
         self.hass.async_create_task(self._async_performance_tick())
+
+    @callback
+    def _panel_thermal_callback(self, _now) -> None:
+        from .performance.sample import step_panel_thermal
+
+        try:
+            step_panel_thermal(self)
+        except Exception as err:  # noqa: BLE001 — a missed step only means a coarser lag
+            _LOGGER.debug("Panel temperature step failed: %s", err)
 
     async def _async_performance_tick(self) -> None:
         from .performance.tick import async_performance_tick
@@ -5050,12 +5112,19 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         from .tariff_store import TariffRateStore
 
         tariff_payload = dict(tariff)
+        export_was = self.plant.tariff.export_provider
         incoming_dynamic = tariff_payload.get("dynamic")
         if isinstance(incoming_dynamic, dict):
             current_dynamic = self.plant.tariff.dynamic.to_dict(include_api_key=True)
             tariff_payload["dynamic"] = merge_tariff_dynamic_config(
                 current_dynamic, incoming_dynamic
             )
+        # The export supplier's login is saved from its own card: keep it (and the choice, if not sent)
+        tariff_payload["export_supplier"] = merge_tariff_dynamic_config(
+            self.plant.tariff.export_supplier.to_dict(include_api_key=True),
+            tariff_payload.get("export_supplier") or {},
+        )
+        tariff_payload.setdefault("export_provider", self.plant.tariff.export_provider)
         cfg = TariffConfig.from_dict(tariff_payload)
         for label, source, entity_id in (
             ("Import", cfg.import_source, cfg.import_entity),
@@ -5093,8 +5162,13 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             source=source_kind,
             recorded_at=cfg.last_updated_at,
         )
+        self._setup_export_supplier_timer()
+        if export_was != cfg.export_provider and self._octopus_native_active():
+            # The import supplier fetches export only for "same": refetch so the cache follows the new choice
+            await self._async_refresh_octopus(force=True)
         # Band export edits feed SmartCharge / sensors straight away when import is API-driven.
         self._apply_manual_export_to_cache()
+        self._sync_octopus_current_rates_from_cache()
         try:
             await self.async_update_tariff_sensors(record_history=False)
         except Exception:
@@ -5155,11 +5229,15 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cfg.kind = "dynamic"
         from homeassistant.util import dt as dt_util
 
+        # Round trip so the export choice is re-checked against the new import supplier (tariff_export.py) and the
+        # supplier's "export from API" follows it, whatever the card sent
+        cfg = TariffConfig.from_dict(cfg.to_dict(include_secrets=True))
         cfg.last_updated_at = dt_util.utcnow().isoformat()
         data = dict(self.config_entry.data)
         data[CONF_TARIFF] = cfg.to_dict(include_secrets=True)
         self.hass.config_entries.async_update_entry(self.config_entry, data=data)
         self.update_plant_config(PlantConfig.from_entry_data(data))
+        self._setup_export_supplier_timer()
         if fetch_now and cfg.dynamic.native_api():
             await self._async_refresh_octopus(force=True, user=True)
             if apply_schedule and self._octopus_cache.get("schedule"):
@@ -5652,41 +5730,74 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Import from a supplier API, export priced from the band editor (another supplier)."""
         if not self._octopus_native_active():
             return False
-        if not self.plant.tariff.dynamic.export_from_api:
+        if self.plant.tariff.export_provider == "manual":
             return True
         return self._octopus_cache.get("export_rates_source") == "manual"
 
-    def _apply_manual_export_to_cache(self) -> None:
-        """Replace API export rows with the band editor's export when export is not from the API.
+    def _export_entity_rows(self) -> list[dict[str, Any]]:
+        """Export rows from the Export Home Assistant sensor: its rate list if it has one, else today's price."""
+        from .smart_charge.entity_rates import collect_rate_rows_from_attributes, merge_rate_rows
+        from .tariff_export import flat_rows
+        from .tariff_rates import _resolve_entity_minor
 
-        Used when export is off in supplier settings, or the supplier returned no export rates
-        (e.g. E.ON Next import with a Fused fixed SEG). Without this the hourly schedule rebuild
-        wrote 0p export into every band and SmartCharge planned with 0p export.
+        tariff = self.plant.tariff
+        entity_id = tariff.export_entity
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if state is None:
+            return []
+        rows = merge_rate_rows(collect_rate_rows_from_attributes(state.attributes))
+        if rows:
+            return rows
+        value, _meta = _resolve_entity_minor(self.hass, entity_id, per_day=False, currency=tariff.currency)
+        return flat_rows(value) if value is not None else []
+
+    def _export_override_rows(self) -> list[dict[str, Any]] | None:
+        """Export rows when export is priced apart from import (sensor or another supplier); None otherwise."""
+        from .tariff_export import export_mode
+
+        mode = export_mode(self.plant.tariff)
+        if mode == "entity":
+            return self._export_entity_rows() or None
+        if mode == "supplier":
+            return list(self._export_supplier_cache.get("export_rates") or []) or None
+        return None
+
+    def _apply_manual_export_to_cache(self) -> None:
+        """Lay the chosen export rows over the supplier's rate cache (tariff_export.py).
+
+        Export from the import supplier's API stays as fetched. Otherwise it's the Export sensor's rates or the
+        export supplier's, and the band editor's export when there are none of those: export off in supplier
+        settings, or the supplier returned no export rates (e.g. E.ON Next import with a Fused fixed SEG).
+        Without this the hourly schedule rebuild wrote 0p export into every band and SmartCharge planned with
+        0p export.
         """
         from homeassistant.util import dt as dt_util
 
         from .octopus_tariff import build_schedule_from_rates, is_variable_tariff_type, rate_at
         from .smart_charge.engine import local_tz
         from .smart_charge.planner import schedule_rate_rows
+        from .tariff_export import export_mode
 
         cache = self._octopus_cache
         if not self._octopus_native_active() or not cache.get("import_rates"):
             return
-        if (
-            self.plant.tariff.dynamic.export_from_api
-            and cache.get("export_rates")
-            and cache.get("export_rates_source") != "manual"
+        mode = export_mode(self.plant.tariff)
+        if mode == "import" and cache.get("export_rates") and cache.get("export_rates_source") not in (
+            "manual",
+            "entity",
+            "supplier",
         ):
             cache["export_rates_source"] = "api"
             return
         schedule = self.plant.tariff.schedule_config()
         now = dt_util.utcnow()
-        rows = schedule_rate_rows(
-            schedule.rates_at, now=now, tz=local_tz(), key="export_p_per_kwh"
-        )
+        rows = self._export_override_rows()
+        source = mode if rows else "manual"
+        if not rows:
+            rows = schedule_rate_rows(schedule.rates_at, now=now, tz=local_tz(), key="export_p_per_kwh")
         cache["export_rates"] = rows
         cache["export_rates_count"] = len(rows)
-        cache["export_rates_source"] = "manual"
+        cache["export_rates_source"] = source
         cache["current_export_p_per_kwh"] = rate_at(now, rows)
         if not is_variable_tariff_type(str(cache.get("tariff_type") or "")):
             built = build_schedule_from_rates(
@@ -5695,6 +5806,192 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 export_by_hour=schedule.export_p_by_hour(),
             )
             cache["schedule"] = built.to_dict() if built else None
+
+    # --- Export from another supplier (tariff_export.py) -------------------------------------------------------
+
+    def _export_supplier_store_handle(self) -> Any:
+        if self._export_supplier_store is None:
+            from homeassistant.helpers.storage import Store
+
+            self._export_supplier_store = Store(self.hass, 1, f"foxess_plant.export_supplier.{self.config_entry.entry_id}")
+        return self._export_supplier_store
+
+    async def _async_load_export_supplier(self) -> None:
+        try:
+            data = await self._export_supplier_store_handle().async_load()
+        except Exception:
+            _LOGGER.exception("Export supplier store read failed")
+            return
+        if isinstance(data, dict):
+            self._export_supplier_cache = data
+            self._apply_manual_export_to_cache()
+
+    def _save_export_supplier(self) -> None:
+        cache = dict(self._export_supplier_cache)
+        self._export_supplier_store_handle().async_delay_save(lambda: cache, 2)
+
+    def _setup_export_supplier_timer(self) -> None:
+        if self._unsub_export_supplier:
+            self._unsub_export_supplier()
+            self._unsub_export_supplier = None
+        if not self.plant.tariff.export_supplier.enabled:
+            return
+        self._unsub_export_supplier = async_track_time_interval(
+            self.hass, self._export_supplier_timer_callback, timedelta(minutes=10)
+        )
+        # Fetches only if the saved fetch / attempt times say one is due
+        self.hass.async_create_task(self._async_refresh_export_supplier())
+
+    @callback
+    def _export_supplier_timer_callback(self, _now) -> None:
+        self.hass.async_create_task(self._async_refresh_export_supplier())
+
+    async def _async_export_supplier_client(self, cfg: Any) -> Any:
+        if cfg.provider == "eon_next":
+            return await self._eon_next_client_for(
+                email=cfg.email or "", password=cfg.password or "", refresh_token=cfg.refresh_token or ""
+            )
+        from .octopus_api import OctopusApiClient
+
+        return OctopusApiClient(self.hass, api_key=str(cfg.api_key or ""))
+
+    async def _async_fetch_export_supplier(self, cfg: Any) -> dict[str, Any]:
+        from .tariff_export import fetch_eon_next_export, fetch_octopus_export
+
+        client = await self._async_export_supplier_client(cfg)
+        if cfg.provider == "eon_next":
+            return await fetch_eon_next_export(client, account_number=cfg.account_number, export_mpan=cfg.export_mpan)
+        return await fetch_octopus_export(
+            client, account_number=str(cfg.account_number or ""), export_mpan=cfg.export_mpan
+        )
+
+    async def _async_refresh_export_supplier(self, *, force: bool = False) -> None:
+        """Export rates from the export supplier: at most hourly, and a failure waits an hour too."""
+        from homeassistant.util import dt as dt_util
+
+        from .eon_next_api import EonNextApiError
+        from .octopus_api import OctopusApiError
+        from .octopus_tariff import rate_at
+        from .tariff_export import REFRESH
+
+        cfg = self.plant.tariff.export_supplier
+        if not cfg.enabled:
+            return
+        if not cfg.native_credentials_configured() or (cfg.provider == "octopus" and not cfg.account_number):
+            self._export_supplier_cache["last_error"] = "Export supplier login not set"
+            return
+        cache = self._export_supplier_cache
+        if not force:
+            for key in ("last_fetch_at", "last_attempt_at"):
+                age = self._octopus_parse_iso_age(cache.get(key))
+                if age is not None and age < REFRESH and cache.get("provider") == cfg.provider:
+                    return
+        now = dt_util.utcnow()
+        cache["last_attempt_at"] = now.isoformat()
+        try:
+            result = await self._async_fetch_export_supplier(cfg)
+        except (OctopusApiError, EonNextApiError) as err:
+            cache["last_error"] = str(err)
+            _LOGGER.warning("Export supplier (%s) fetch failed: %s", cfg.provider, err)
+        else:
+            cache.update(result)
+            cache.update(
+                provider=cfg.provider,
+                last_fetch_at=now.isoformat(),
+                last_error=None,
+                current_export_p_per_kwh=rate_at(now, result["export_rates"]),
+            )
+            self._apply_manual_export_to_cache()
+            self._sync_octopus_current_rates_from_cache()
+        self._save_export_supplier()
+        await self.async_request_refresh()
+
+    def _export_status(self) -> dict[str, Any]:
+        from homeassistant.util import dt as dt_util
+
+        from .octopus_tariff import rate_at
+        from .tariff_export import export_label
+
+        tariff = self.plant.tariff
+        cache = self._export_supplier_cache
+        rows = self._export_override_rows() or []
+        return {
+            "provider": tariff.export_provider,
+            "label": export_label(tariff),
+            "supplier": tariff.export_supplier.to_dict(include_api_key=False),
+            "export_tariff_code": cache.get("export_tariff_code") if tariff.export_supplier.enabled else None,
+            "export_meters": cache.get("export_meters") or [],
+            "last_fetch_at": cache.get("last_fetch_at") if tariff.export_supplier.enabled else None,
+            "last_error": cache.get("last_error") if tariff.export_supplier.enabled else None,
+            "rates_count": len(rows),
+            "current_export_p_per_kwh": rate_at(dt_util.utcnow(), rows) if rows else None,
+        }
+
+    async def async_save_export_supplier(self, *, export: dict[str, Any]) -> dict[str, Any]:
+        """Save the Export provider (and a separate supplier's login), then fetch its rates."""
+        from .models import merge_tariff_dynamic_config
+        from .tariff_export import PROVIDERS
+
+        provider = str(export.pop("provider", "") or "").strip().lower()
+        if provider not in PROVIDERS:
+            raise HomeAssistantError(f"Unknown export provider {provider!r}")
+        raw = self.plant.tariff.to_dict(include_secrets=True)
+        raw["export_provider"] = provider
+        entity_id = export.pop("export_entity", None)
+        if provider == "entity":
+            if not entity_id:
+                raise HomeAssistantError("Choose the export price sensor")
+            st = self.hass.states.get(entity_id)
+            if st is None or not entity_id.startswith("sensor."):
+                raise HomeAssistantError(f"Export sensor {entity_id} is not an available sensor")
+            raw["export_entity"] = entity_id
+        if export:
+            raw["export_supplier"] = merge_tariff_dynamic_config(raw.get("export_supplier") or {}, export)
+        cfg = TariffConfig.from_dict(raw)
+        sup = cfg.export_supplier
+        if sup.enabled:
+            if sup.provider == "eon_next" and not sup.native_credentials_configured():
+                raise HomeAssistantError("E.ON Next sign-in token (or email and password) is required for export")
+            if sup.provider == "octopus" and (not sup.api_key_configured() or not sup.account_number):
+                raise HomeAssistantError("Octopus API key and account number are required for export")
+        from homeassistant.util import dt as dt_util
+
+        cfg.last_updated_at = dt_util.utcnow().isoformat()
+        data = dict(self.config_entry.data)
+        data[CONF_TARIFF] = cfg.to_dict(include_secrets=True)
+        self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+        self.update_plant_config(PlantConfig.from_entry_data(data))
+        self._setup_export_supplier_timer()
+        if sup.enabled:
+            await self._async_refresh_export_supplier(force=True)
+        # The import supplier fetches export only for "same": refetch so the cache follows the new choice
+        if self._octopus_native_active():
+            await self._async_refresh_octopus(force=True)
+        self._apply_manual_export_to_cache()
+        self._sync_octopus_current_rates_from_cache()
+        try:
+            await self.async_update_tariff_sensors(record_history=True)
+        except Exception:
+            _LOGGER.exception("Tariff sensor update failed after export save")
+        await self.async_request_refresh()
+        return self._export_status()
+
+    async def async_test_export_supplier(self, *, export: dict[str, Any]) -> dict[str, Any]:
+        """Check a separate export supplier's login and list its export meters (nothing saved)."""
+        from .eon_next_api import EonNextApiError
+        from .models import TariffDynamicConfig, merge_tariff_dynamic_config
+        from .octopus_api import OctopusApiError
+
+        provider = str(export.pop("provider", "") or "").strip().lower()
+        merged = merge_tariff_dynamic_config(self.plant.tariff.export_supplier.to_dict(include_api_key=True), export)
+        cfg = TariffDynamicConfig.from_dict({**merged, "provider": provider, "enabled": True, "source": "native"})
+        if not cfg.native_credentials_configured() or (provider == "octopus" and not cfg.account_number):
+            raise HomeAssistantError("Enter the export supplier's login first")
+        try:
+            result = await self._async_fetch_export_supplier(cfg)
+        except (OctopusApiError, EonNextApiError) as err:
+            raise HomeAssistantError(str(err)) from err
+        return {k: v for k, v in result.items() if k != "export_rates"} | {"rates_count": len(result["export_rates"])}
 
     async def _async_sync_octopus_standing_charge(self) -> bool:
         """Persist Octopus standing charge into plugin tariff when it changes.
@@ -6109,6 +6406,12 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if getattr(self, "_unsub_open_meteo", None):
             self._unsub_open_meteo()
             self._unsub_open_meteo = None
+        if getattr(self, "_unsub_panel_thermal", None):
+            self._unsub_panel_thermal()
+            self._unsub_panel_thermal = None
+        if getattr(self, "_unsub_export_supplier", None):
+            self._unsub_export_supplier()
+            self._unsub_export_supplier = None
         if self._unsub_triggers:
             self._unsub_triggers()
             self._unsub_triggers = None
