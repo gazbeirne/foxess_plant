@@ -1127,14 +1127,22 @@ class TariffDynamicConfig:
 
         return self.enabled and self.provider == EON_NEXT_PROVIDER and self.source == "native"
 
+    def native_fuse(self) -> bool:
+        from .fuse_parse import FUSE_PROVIDER
+
+        return self.enabled and self.provider == FUSE_PROVIDER and self.source == "native"
+
     def native_api(self) -> bool:
-        """Any supplier polled directly for rates (Octopus or E.ON Next)."""
-        return self.native_octopus() or self.native_eon_next()
+        """Any supplier polled directly for rates (Octopus, E.ON Next or Fuse)."""
+        return self.native_octopus() or self.native_eon_next() or self.native_fuse()
 
     def refresh_token_configured(self) -> bool:
         return bool(self.refresh_token)
 
     def native_credentials_configured(self) -> bool:
+        if self.native_fuse() or self.provider == "fuse":
+            # Fuse signs in with a texted code; the session lives in its own store (fuse_api.py), checked on fetch
+            return True
         if self.native_eon_next():
             return self.refresh_token_configured() or bool(self.email and self.password_configured())
         return self.api_key_configured()
@@ -1228,7 +1236,8 @@ class TariffConfig:
     apply_band_inverter_control: bool = False
     dynamic: TariffDynamicConfig = field(default_factory=TariffDynamicConfig)
     # Who prices export (tariff_export.py): "same" as the import supplier, "manual" band rates, "entity" (a Home
-    # Assistant sensor), or a different supplier's API ("octopus" / "eon_next", login in export_supplier)
+    # Assistant sensor), or a different supplier's API ("octopus" / "eon_next" / "fuse", login in export_supplier;
+    # Fuse's sign-in is in its own store)
     export_provider: str = "same"
     export_supplier: TariffDynamicConfig = field(default_factory=TariffDynamicConfig)
     last_updated_at: str | None = None
@@ -1292,7 +1301,7 @@ class TariffConfig:
             import_p=import_p,
             export_p=export_p,
         )
-        from .tariff_export import normalize_export_provider
+        from .tariff_export import SUPPLIERS, normalize_export_provider
 
         dynamic = TariffDynamicConfig.from_dict(raw.get("dynamic"))
         export_source = _export_source()
@@ -1302,7 +1311,7 @@ class TariffConfig:
         # The import supplier fetches export only when export is "same"
         dynamic.export_from_api = export_provider == "same"
         export_supplier = TariffDynamicConfig.from_dict(raw.get("export_supplier"))
-        export_supplier.enabled = export_provider in ("octopus", "eon_next")
+        export_supplier.enabled = export_provider in SUPPLIERS
         if export_supplier.enabled:
             export_supplier.provider = export_provider
             export_supplier.source = "native"

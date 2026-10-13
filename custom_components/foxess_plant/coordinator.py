@@ -182,6 +182,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._eon_next_client_key: tuple[str, str, str] | None = None
         self._eon_next_auth_store: Any = None
         self._supplier_tariff_store: Any = None
+        # Fuse (fuse_api.py): one sign-in for import and export - cookies, phone, saved tariffs, fetch times
+        self._fuse_state: dict[str, Any] = {}
+        self._fuse_store: Any = None
+        self._fuse_session: Any = None
+        self._fuse_lock = asyncio.Lock()
         self._octopus_greener_store = None
         self._octopus_greener_cache: dict[str, Any] = {}
         self._octopus_greener_history_count = 0
@@ -560,6 +565,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         state["octopus"] = self._octopus_status()
         state["export"] = self._export_status()
+        state["fuse"] = self._fuse_status()
         # Drives the Octopus Energy Analysis report, which only exists for Octopus.
         state["octopus_api_active"] = self._octopus_native_active() and self._octopus_greener_enabled()
         state["octopus_greener"] = self._octopus_greener_state()
@@ -628,7 +634,10 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return dyn.native_api() and dyn.native_credentials_configured()
 
     def _tariff_provider_label(self) -> str:
-        return "E.ON Next" if self.plant.tariff.dynamic.native_eon_next() else "Octopus"
+        dyn = self.plant.tariff.dynamic
+        if dyn.native_fuse():
+            return "Fuse"
+        return "E.ON Next" if dyn.native_eon_next() else "Octopus"
 
     def _octopus_agile_active(self) -> bool:
         from .octopus_tariff import is_variable_tariff_type
@@ -1265,6 +1274,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_load_tariff_storage()
         await self._async_restore_supplier_tariff()
         await self._async_load_export_supplier()
+        await self._async_load_fuse()
         self._sync_trigger_membership()
         self.setup_trigger_listeners()
         await super().async_config_entry_first_refresh()
@@ -5207,7 +5217,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             merged["provider"] = OCTOPUS_PROVIDER
         cfg = TariffConfig.from_dict(self.plant.tariff.to_dict(include_secrets=True))
         cfg.dynamic = TariffDynamicConfig.from_dict(merged)
-        if cfg.dynamic.native_eon_next():
+        if cfg.dynamic.native_fuse():
+            pass  # signs in with a texted code on its own card; nothing to check here
+        elif cfg.dynamic.native_eon_next():
             if not cfg.dynamic.native_credentials_configured():
                 raise HomeAssistantError("E.ON Next sign-in token (or email and password) is required")
         elif cfg.dynamic.enabled and cfg.dynamic.source == OCTOPUS_SOURCE_NATIVE:
@@ -5274,6 +5286,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         from .octopus_tariff import test_octopus_connection
 
         dyn = self.plant.tariff.dynamic
+        if (provider or dyn.provider) == "fuse":
+            await self._async_refresh_fuse(force=True)
+            if self._fuse_state.get("last_error"):
+                raise HomeAssistantError(self._fuse_state["last_error"])
+            return {"fuse": self._fuse_status()}
         if (provider or dyn.provider) == EON_NEXT_PROVIDER:
             return await self._async_test_eon_next(
                 email=email,
@@ -5454,6 +5471,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         from .octopus_tariff import fetch_octopus_tariff_snapshot, list_account_meters
 
         dyn = self.plant.tariff.dynamic
+        if dyn.native_fuse():
+            await self._async_refresh_fuse(force=force or user)
+            return
         if dyn.native_eon_next():
             await self._async_refresh_eon_next(force=force, user=user)
             return
@@ -5759,6 +5779,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if mode == "entity":
             return self._export_entity_rows() or None
         if mode == "supplier":
+            if self.plant.tariff.export_provider == "fuse":
+                return self._fuse_rows("ELEC_EXPORT") or None
             return list(self._export_supplier_cache.get("export_rates") or []) or None
         return None
 
@@ -5877,6 +5899,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cfg = self.plant.tariff.export_supplier
         if not cfg.enabled:
             return
+        if cfg.provider == "fuse":  # its own sign-in, store and fetch rules
+            await self._async_refresh_fuse(force=force)
+            return
         if not cfg.native_credentials_configured() or (cfg.provider == "octopus" and not cfg.account_number):
             self._export_supplier_cache["last_error"] = "Export supplier login not set"
             return
@@ -5914,6 +5939,13 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         tariff = self.plant.tariff
         cache = self._export_supplier_cache
+        if tariff.export_provider == "fuse":
+            fuse = self._fuse_state
+            cache = {
+                "export_tariff_code": ((fuse.get("tariffs") or {}).get("ELEC_EXPORT") or {}).get("name"),
+                "last_fetch_at": fuse.get("last_fetch_at"),
+                "last_error": fuse.get("last_error"),
+            }
         rows = self._export_override_rows() or []
         return {
             "provider": tariff.export_provider,
@@ -5983,6 +6015,14 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         from .octopus_api import OctopusApiError
 
         provider = str(export.pop("provider", "") or "").strip().lower()
+        if provider == "fuse":
+            await self._async_refresh_fuse(force=True)
+            tariff = (self._fuse_state.get("tariffs") or {}).get("ELEC_EXPORT")
+            if self._fuse_state.get("last_error"):
+                raise HomeAssistantError(self._fuse_state["last_error"])
+            if not tariff:
+                raise HomeAssistantError("No export supply on this Fuse account")
+            return {"export_tariff_code": tariff["name"], "rates_count": len(self._fuse_rows("ELEC_EXPORT"))}
         merged = merge_tariff_dynamic_config(self.plant.tariff.export_supplier.to_dict(include_api_key=True), export)
         cfg = TariffDynamicConfig.from_dict({**merged, "provider": provider, "enabled": True, "source": "native"})
         if not cfg.native_credentials_configured() or (provider == "octopus" and not cfg.account_number):
@@ -5992,6 +6032,285 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (OctopusApiError, EonNextApiError) as err:
             raise HomeAssistantError(str(err)) from err
         return {k: v for k, v in result.items() if k != "export_rates"} | {"rates_count": len(result["export_rates"])}
+
+    # --- Fuse (fuse_api.py): one sign-in for import and export ---------------------------------------------------
+
+    def _fuse_store_handle(self) -> Any:
+        if self._fuse_store is None:
+            from homeassistant.helpers.storage import Store
+
+            self._fuse_store = Store(self.hass, 1, f"foxess_plant.fuse.{self.config_entry.entry_id}")
+        return self._fuse_store
+
+    async def _async_load_fuse(self) -> None:
+        try:
+            data = await self._fuse_store_handle().async_load()
+        except Exception:
+            _LOGGER.exception("Fuse store read failed")
+            return
+        if isinstance(data, dict):
+            self._fuse_state = data
+            self._fuse_apply()
+
+    async def _async_save_fuse(self) -> None:
+        # Saved straight away: the sign-in cookie must survive a restart (persist state, not memory)
+        await self._fuse_store_handle().async_save(dict(self._fuse_state))
+
+    def _fuse_in_use(self) -> bool:
+        tariff = self.plant.tariff
+        return tariff.dynamic.native_fuse() or tariff.export_provider == "fuse"
+
+    def _fuse_needed(self) -> tuple[str, ...]:
+        """Fuse supplies the saved settings depend on (export under "same" is used if there, never required)."""
+        from .fuse_parse import SUPPLY_EXPORT, SUPPLY_IMPORT
+
+        tariff = self.plant.tariff
+        needed = []
+        if tariff.dynamic.native_fuse():
+            needed.append(SUPPLY_IMPORT)
+        if tariff.export_provider == "fuse":
+            needed.append(SUPPLY_EXPORT)
+        return tuple(needed)
+
+    def _fuse_rows(self, kind: str) -> list[dict[str, Any]]:
+        """Half-hour rows for a saved Fuse tariff, built now (no network), so they never run out."""
+        from homeassistant.util import dt as dt_util
+
+        from .fuse_parse import FuseTariff, window_rows
+
+        raw = (self._fuse_state.get("tariffs") or {}).get(kind)
+        if not raw:
+            return []
+        try:
+            return window_rows(FuseTariff.from_dict(raw), dt_util.utcnow())
+        except (TypeError, ValueError, KeyError):
+            _LOGGER.exception("Saved Fuse %s tariff unreadable", kind)
+            return []
+
+    def _fuse_client(self) -> Any:
+        from .fuse_api import FuseWebClient
+
+        if self._fuse_session is None:
+            import aiohttp
+            from homeassistant.helpers.aiohttp_client import async_create_clientsession
+
+            # Cookie-less: Fox Plant keeps Fuse's cookies itself, out of Home Assistant's shared session
+            self._fuse_session = async_create_clientsession(self.hass, cookie_jar=aiohttp.DummyCookieJar())
+
+        async def _persist(cookies: dict[str, str]) -> None:
+            self._fuse_state["cookies"] = cookies
+            await self._async_save_fuse()
+
+        return FuseWebClient(self._fuse_session, cookies=self._fuse_state.get("cookies") or {}, on_cookies=_persist)
+
+    async def async_fuse_send_code(self, phone: str) -> dict[str, Any]:
+        from homeassistant.util import dt as dt_util
+
+        from .fuse_api import FuseApiError
+        from .fuse_parse import FuseParseError, normalize_phone
+
+        try:
+            number = normalize_phone(phone)
+        except FuseParseError as err:
+            raise HomeAssistantError(str(err)) from err
+        client = self._fuse_client()
+        try:
+            await client.send_code(number)
+        except FuseApiError as err:
+            raise HomeAssistantError(str(err)) from err
+        self._fuse_state.update(phone=number, code_sent_at=dt_util.utcnow().isoformat(), cookies=client.cookies)
+        await self._async_save_fuse()
+        return self._fuse_status()
+
+    async def async_fuse_verify_code(self, code: str) -> dict[str, Any]:
+        import re
+
+        from homeassistant.util import dt as dt_util
+
+        from .fuse_api import FuseApiError
+
+        digits = re.sub(r"\D", "", str(code or ""))
+        if len(digits) != 6:
+            raise HomeAssistantError("Enter the 6-digit code Fuse texted you")
+        client = self._fuse_client()
+        try:
+            await client.verify_code(digits)
+        except FuseApiError as err:
+            raise HomeAssistantError(str(err)) from err
+        self._fuse_state.update(
+            cookies=client.cookies,
+            signed_in_at=dt_util.utcnow().isoformat(),
+            code_sent_at=None,
+            auth_failed=False,
+            last_error=None,
+        )
+        await self._async_save_fuse()
+        self._fuse_signin_notice(None)
+        await self._async_refresh_fuse(force=True)
+        await self.async_request_refresh()
+        return self._fuse_status()
+
+    async def async_fuse_sign_out(self) -> dict[str, Any]:
+        """Forget the Fuse session (the saved tariffs stay in use until replaced)."""
+        self._fuse_state.pop("cookies", None)
+        self._fuse_state.update(signed_in_at=None, code_sent_at=None, auth_failed=False)
+        await self._async_save_fuse()
+        await self.async_request_refresh()
+        return self._fuse_status()
+
+    async def async_fuse_fetch(self) -> dict[str, Any]:
+        await self._async_refresh_fuse(force=True)
+        await self.async_request_refresh()
+        return self._fuse_status()
+
+    async def _async_refresh_fuse(self, *, force: bool = False) -> None:
+        """Fetch Fuse tariffs when due (fuse_parse.fetch_due) or forced; always rebuild the rows afterwards."""
+        from homeassistant.util import dt as dt_util
+
+        from .fuse_api import FuseApiError, FuseAuthRequired, fetch_fuse_tariffs
+        from .fuse_parse import UK_TZ, fetch_due
+
+        state = self._fuse_state
+        now = dt_util.utcnow()
+        today = now.astimezone(UK_TZ).date()
+        needed = self._fuse_needed()
+        if not force and (not needed or not fetch_due(state, needed=needed, now=now, today=today)):
+            self._fuse_apply()
+            return
+        if not (state.get("cookies") or {}).get("app-auth"):
+            state["last_error"] = "Sign in to Fuse: enter your mobile number and the code Fuse texts you"
+            self._fuse_apply()
+            return
+        fetched = False
+        async with self._fuse_lock:
+            state["last_attempt_at"] = now.isoformat()
+            try:
+                tariffs = await fetch_fuse_tariffs(self._fuse_client(), today=today)
+            except FuseAuthRequired as err:
+                state.update(auth_failed=True, last_error=str(err))
+                self._fuse_signin_notice(str(err))
+                _LOGGER.warning("Fuse: %s", err)
+            except FuseApiError as err:
+                state["last_error"] = str(err)
+                _LOGGER.warning("Fuse tariff fetch failed: %s", err)
+            else:
+                missing = [k.split("_")[-1].lower() for k in needed if k not in tariffs]
+                state.update(
+                    tariffs=tariffs,
+                    last_fetch_at=now.isoformat(),
+                    auth_failed=False,
+                    # A missing supply waits like a failure, so it isn't asked for on every tick
+                    last_error=f"No {' or '.join(missing)} supply on this Fuse account" if missing else None,
+                )
+                fetched = True
+            await self._async_save_fuse()
+        self._fuse_apply()
+        if fetched and self.plant.tariff.dynamic.native_fuse():
+            await self._async_sync_octopus_standing_charge()
+            await self._async_auto_apply_octopus_schedule()
+        if fetched:
+            try:
+                await self.async_update_tariff_sensors(record_history=True)
+            except Exception:
+                _LOGGER.exception("Tariff sensor update failed after Fuse fetch")
+
+    def _fuse_apply(self) -> None:
+        """Fuse import: rebuild the shared rate cache from the saved tariffs (cheap, no network)."""
+        from homeassistant.util import dt as dt_util
+
+        from .fuse_api import build_fuse_cache
+        from .fuse_parse import SUPPLY_EXPORT, SUPPLY_IMPORT
+
+        if not self.plant.tariff.dynamic.native_fuse():
+            return
+        tariffs = self._fuse_state.get("tariffs") or {}
+        if not tariffs.get(SUPPLY_IMPORT):
+            self._octopus_cache["last_error"] = (
+                self._fuse_state.get("last_error") or "No Fuse import tariff yet - sign in and press Fetch Rates Now"
+            )
+            return
+        export = tariffs.get(SUPPLY_EXPORT) if self.plant.tariff.export_provider == "same" else None
+        try:
+            cache = build_fuse_cache(tariffs[SUPPLY_IMPORT], export, now=dt_util.utcnow())
+        except (TypeError, ValueError, KeyError):
+            _LOGGER.exception("Saved Fuse tariff unreadable")
+            return
+        cache["last_fetch_at"] = self._fuse_state.get("last_fetch_at")
+        cache["last_error"] = self._fuse_state.get("last_error")
+        self._octopus_cache = cache
+        self._apply_manual_export_to_cache()
+        self._sync_octopus_current_rates_from_cache()
+
+    def _fuse_signin_notice(self, message: str | None) -> None:
+        """A Home Assistant notification when Fuse ends the session (removed once signed in again)."""
+        from homeassistant.components import persistent_notification
+
+        notification_id = f"foxess_plant_fuse_signin_{self.config_entry.entry_id}"
+        if message is None:
+            persistent_notification.async_dismiss(self.hass, notification_id)
+            return
+        persistent_notification.async_create(
+            self.hass,
+            f"{message}. Fox Plant keeps using the last Fuse rates it saved. Open Fox Plant → Settings → Tariff, "
+            "enter your mobile number, press Send Code and type in the code Fuse texts you.",
+            title="Fox Plant: sign in to Fuse again",
+            notification_id=notification_id,
+        )
+
+    def _fuse_status(self) -> dict[str, Any]:
+        from homeassistant.util import dt as dt_util
+
+        from .fuse_parse import UK_TZ, FuseTariff, parse_iso, describe_rates, mask_phone
+        from .octopus_tariff import rate_at
+
+        state = self._fuse_state
+        now = dt_util.utcnow()
+        today = now.astimezone(UK_TZ).date().isoformat()
+        tariffs: dict[str, Any] = {}
+        for kind, raw in (state.get("tariffs") or {}).items():
+            try:
+                t = FuseTariff.from_dict(raw)
+            except (TypeError, ValueError, KeyError):
+                continue
+            rows = self._fuse_rows(kind)
+
+            def hhmm(m: int) -> str:
+                return f"{m // 60 % 24:02d}:{m % 60:02d}"
+
+            tariffs[kind] = {
+                "name": t.name,
+                "rates": [
+                    {
+                        "name": r.name,
+                        "p_per_kwh": r.p_per_kwh,
+                        "windows": [[hhmm(a), hhmm(b)] for a, b in r.windows] if r.windows else None,
+                    }
+                    for r in t.rates
+                ],
+                "rates_text": describe_rates(t),
+                "standing_p_per_day": t.standing_p_per_day,
+                "start_date": t.start_date,
+                "end_date": t.end_date,
+                "fixed": t.fixed,
+                "next_update_date": t.next_update_date,
+                "next_update_reason": t.next_update_reason,
+                "next_prices_from": t.next_prices_from,
+                "current_p_per_kwh": rate_at(now, rows) if rows else None,
+                "ended": bool(t.end_date and t.end_date < today),
+            }
+        sent = parse_iso(state.get("code_sent_at"))
+        return {
+            "signed_in": bool((state.get("cookies") or {}).get("app-auth")) and not state.get("auth_failed"),
+            "phone": mask_phone(state.get("phone")),
+            "code_sent": bool(sent and now - sent < timedelta(minutes=10)),
+            "signed_in_at": state.get("signed_in_at"),
+            "last_fetch_at": state.get("last_fetch_at"),
+            "last_attempt_at": state.get("last_attempt_at"),
+            "last_error": state.get("last_error"),
+            "auth_failed": bool(state.get("auth_failed")),
+            "in_use": self._fuse_in_use(),
+            "tariffs": tariffs,
+        }
 
     async def _async_sync_octopus_standing_charge(self) -> bool:
         """Persist Octopus standing charge into plugin tariff when it changes.

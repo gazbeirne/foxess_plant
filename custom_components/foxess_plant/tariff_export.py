@@ -2,8 +2,8 @@
 
 Import comes from a supplier API (Octopus / E.ON Next), a Home Assistant sensor, or the band schedule. Export can
 come from the same place ("same"), the band schedule ("manual", e.g. a fixed SEG typed in), a Home Assistant
-sensor ("entity"), or a *different* supplier's API ("octopus" / "eon_next", with its own login) — e.g. E.ON Next
-import with Octopus Outgoing export.
+sensor ("entity"), or a *different* supplier's API ("octopus" / "eon_next" / "fuse", with its own login) — e.g. E.ON
+Next import with Octopus Outgoing or Fuse export.
 
 Every consumer (SmartCharge, savings, tariff sensors) reads export from the one rate cache; the coordinator lays
 the chosen export rows over it (``_apply_manual_export_to_cache``), so nothing else needs to know where they
@@ -20,9 +20,9 @@ from homeassistant.util import dt as dt_util
 SAME = "same"
 MANUAL = "manual"
 ENTITY = "entity"
-SUPPLIERS = ("octopus", "eon_next")
+SUPPLIERS = ("octopus", "eon_next", "fuse")
 PROVIDERS = (SAME, MANUAL, ENTITY, *SUPPLIERS)
-SUPPLIER_LABELS = {"octopus": "Octopus", "eon_next": "E.ON Next"}
+SUPPLIER_LABELS = {"octopus": "Octopus", "eon_next": "E.ON Next", "fuse": "Fuse"}
 
 # A separate export supplier is polled at most hourly; a failure waits as long (the Solcast lesson)
 REFRESH = timedelta(minutes=55)

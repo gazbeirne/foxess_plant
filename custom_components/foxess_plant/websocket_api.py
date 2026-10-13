@@ -64,6 +64,11 @@ WS_TYPE_TEST_SOLCAST = "foxess_plant/test_solcast"
 WS_TYPE_UPDATE_OPEN_METEO = "foxess_plant/update_open_meteo"
 WS_TYPE_UPDATE_EXPORT_SUPPLIER = "foxess_plant/update_export_supplier"
 WS_TYPE_TEST_EXPORT_SUPPLIER = "foxess_plant/test_export_supplier"
+# Fuse signs in with a texted code (fuse_api.py)
+WS_TYPE_FUSE_SEND_CODE = "foxess_plant/fuse_send_code"
+WS_TYPE_FUSE_VERIFY_CODE = "foxess_plant/fuse_verify_code"
+WS_TYPE_FUSE_FETCH = "foxess_plant/fuse_fetch"
+WS_TYPE_FUSE_SIGN_OUT = "foxess_plant/fuse_sign_out"
 WS_TYPE_OPEN_METEO_POINTS = "foxess_plant/open_meteo_points"
 WS_TYPE_UPDATE_GLOW = "foxess_plant/update_glow"
 WS_TYPE_TEST_GLOW = "foxess_plant/test_glow"
@@ -242,14 +247,14 @@ TARIFF_SCHEMA = vol.Schema(
         vol.Optional("schedule", default={}): TARIFF_SCHEDULE_SCHEMA,
         vol.Optional("apply_band_inverter_control", default=False): cv.boolean,
         vol.Optional("dynamic", default={}): TARIFF_DYNAMIC_SCHEMA,
-        vol.Optional("export_provider"): vol.In(["same", "manual", "entity", "octopus", "eon_next"]),
+        vol.Optional("export_provider"): vol.In(["same", "manual", "entity", "octopus", "eon_next", "fuse"]),
     }
 )
 
 # Export priced apart from import (tariff_export.py): the choice, and a different supplier's login
 EXPORT_SUPPLIER_SCHEMA = vol.Schema(
     {
-        vol.Required("provider"): vol.In(["same", "manual", "entity", "octopus", "eon_next"]),
+        vol.Required("provider"): vol.In(["same", "manual", "entity", "octopus", "eon_next", "fuse"]),
         vol.Optional("export_entity"): vol.Any(str, None),
         vol.Optional("api_key"): vol.Any(str, None),
         vol.Optional("account_number"): vol.Any(str, None),
@@ -1346,6 +1351,51 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
             return
         connection.send_result(msg["id"], result)
 
+    async def _fuse_call(connection, msg, hass, action) -> None:
+        """Run a Fuse sign-in step; answer with the full plant state (its tariff.fuse has the result)."""
+        coordinator, err_code, err_msg = _get_coordinator(hass, msg.get("plant_id"))
+        if coordinator is None:
+            connection.send_error(msg["id"], err_code, err_msg)
+            return
+        try:
+            await action(coordinator)
+        except HomeAssistantError as err:
+            connection.send_error(msg["id"], "fuse_failed", str(err))
+            return
+        except Exception as err:
+            _LOGGER.exception("Fuse request failed")
+            connection.send_error(msg["id"], "fuse_failed", str(err) or err.__class__.__name__)
+            return
+        connection.send_result(msg["id"], coordinator.get_plant_state())
+
+    @websocket_api.websocket_command(
+        {vol.Required("type"): WS_TYPE_FUSE_SEND_CODE, vol.Optional("plant_id"): str, vol.Required("phone"): str}
+    )
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_fuse_send_code(hass, connection, msg) -> None:
+        await _fuse_call(connection, msg, hass, lambda c: c.async_fuse_send_code(msg["phone"]))
+
+    @websocket_api.websocket_command(
+        {vol.Required("type"): WS_TYPE_FUSE_VERIFY_CODE, vol.Optional("plant_id"): str, vol.Required("code"): str}
+    )
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_fuse_verify_code(hass, connection, msg) -> None:
+        await _fuse_call(connection, msg, hass, lambda c: c.async_fuse_verify_code(msg["code"]))
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_FUSE_FETCH, vol.Optional("plant_id"): str})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_fuse_fetch(hass, connection, msg) -> None:
+        await _fuse_call(connection, msg, hass, lambda c: c.async_fuse_fetch())
+
+    @websocket_api.websocket_command({vol.Required("type"): WS_TYPE_FUSE_SIGN_OUT, vol.Optional("plant_id"): str})
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_fuse_sign_out(hass, connection, msg) -> None:
+        await _fuse_call(connection, msg, hass, lambda c: c.async_fuse_sign_out())
+
     @websocket_api.websocket_command(
         {
             vol.Required("type"): WS_TYPE_TEST_SOLCAST,
@@ -1833,6 +1883,10 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_update_open_meteo)
     websocket_api.async_register_command(hass, ws_update_export_supplier)
     websocket_api.async_register_command(hass, ws_test_export_supplier)
+    websocket_api.async_register_command(hass, ws_fuse_send_code)
+    websocket_api.async_register_command(hass, ws_fuse_verify_code)
+    websocket_api.async_register_command(hass, ws_fuse_fetch)
+    websocket_api.async_register_command(hass, ws_fuse_sign_out)
     websocket_api.async_register_command(hass, ws_open_meteo_points)
     websocket_api.async_register_command(hass, ws_update_glow)
     websocket_api.async_register_command(hass, ws_test_glow)

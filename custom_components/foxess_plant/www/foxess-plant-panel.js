@@ -256,9 +256,12 @@ const DEFAULT_TARIFF = {
     email: "",
     export_from_api: true,
   },
-  // Who prices export (tariff_export.py): same | manual | entity | octopus | eon_next
+  // Who prices export (tariff_export.py): same | manual | entity | octopus | eon_next | fuse
   export_provider: "same",
 };
+
+/** Supplier APIs (tariff_export.SUPPLIERS): each can price import, export, or both. */
+const TARIFF_SUPPLIERS = ["octopus", "eon_next", "fuse"];
 
 /** Import / Export provider pickers on the Tariff page. */
 const TARIFF_IMPORT_PROVIDERS = [
@@ -266,22 +269,23 @@ const TARIFF_IMPORT_PROVIDERS = [
   { id: "entity", label: "Home Assistant Sensor" },
   { id: "octopus", label: "Octopus" },
   { id: "eon_next", label: "E.ON Next" },
+  { id: "fuse", label: "Fuse" },
 ];
 
 /** Import provider id from a tariff (or draft): a supplier, a sensor, or the band schedule. */
 function tariffImportProviderId(tariffOrDraft) {
   const supplier = tariffEnergyProviderId(tariffOrDraft);
-  if (supplier === "octopus" || supplier === "eon_next") return supplier;
+  if (TARIFF_SUPPLIERS.includes(supplier)) return supplier;
   return tariffOrDraft?.import_source === "entity" ? "entity" : "manual";
 }
 
 /** Export choices: "Same As Import" only with an import supplier, and that supplier isn't offered twice. */
 function tariffExportProviderOptions(importProvider) {
-  const supplier = importProvider === "octopus" || importProvider === "eon_next" ? importProvider : "";
+  const supplier = TARIFF_SUPPLIERS.includes(importProvider) ? importProvider : "";
   const opts = [];
   if (supplier) opts.push({ id: "same", label: `Same As Import (${energyProviderLabel(supplier)})` });
   opts.push({ id: "manual", label: "Manual Rates" }, { id: "entity", label: "Home Assistant Sensor" });
-  for (const id of ["octopus", "eon_next"]) {
+  for (const id of TARIFF_SUPPLIERS) {
     if (id !== supplier) opts.push({ id, label: energyProviderLabel(id) });
   }
   return opts;
@@ -289,8 +293,8 @@ function tariffExportProviderOptions(importProvider) {
 
 /** Keep the export choice valid for the import provider (mirrors tariff_export.normalize_export_provider). */
 function normalizeTariffExportProvider(value, importProvider, exportSource) {
-  const supplier = importProvider === "octopus" || importProvider === "eon_next" ? importProvider : "";
-  let v = ["same", "manual", "entity", "octopus", "eon_next"].includes(value) ? value : supplier ? "same" : "manual";
+  const supplier = TARIFF_SUPPLIERS.includes(importProvider) ? importProvider : "";
+  let v = ["same", "manual", "entity", ...TARIFF_SUPPLIERS].includes(value) ? value : supplier ? "same" : "manual";
   if (v === supplier) v = "same";
   if (v === "same" && !supplier) v = exportSource === "entity" ? "entity" : "manual";
   return v;
@@ -305,6 +309,7 @@ const ENERGY_TARIFF_PROVIDERS = [
   { id: "", label: "None" },
   { id: "octopus", label: "Octopus" },
   { id: "eon_next", label: "E.ON Next" },
+  { id: "fuse", label: "Fuse" },
 ];
 
 /** Energy provider picked in the Tariff page select (only known ids survive). */
@@ -347,9 +352,30 @@ function showEonNextTariffProvider(tariffOrDraft) {
   return tariffEnergyProviderId(tariffOrDraft) === "eon_next";
 }
 
-/** Octopus or E.ON Next — both share the supplier draft and websocket commands. */
+function showFuseTariffProvider(tariffOrDraft) {
+  return tariffEnergyProviderId(tariffOrDraft) === "fuse";
+}
+
+/** Octopus, E.ON Next or Fuse — they share the supplier draft and websocket commands. */
 function showSupplierTariffProvider(tariffOrDraft) {
-  return showOctopusTariffProvider(tariffOrDraft) || showEonNextTariffProvider(tariffOrDraft);
+  return (
+    showOctopusTariffProvider(tariffOrDraft) ||
+    showEonNextTariffProvider(tariffOrDraft) ||
+    showFuseTariffProvider(tariffOrDraft)
+  );
+}
+
+/** "1 Oct 2026" from a YYYY-MM-DD date. */
+function formatUkDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = String(iso).split("-").map(Number);
+  if (!y || !m || !d) return String(iso);
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
 }
 
 /** ISO 4217 codes for tariff settings (must match const.py TARIFF_CURRENCIES). */
@@ -438,7 +464,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.513";
+const PANEL_VERSION = "0.9.514";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -17787,7 +17813,7 @@ Reloading panel registration…
     if (!this._octopusDraft) this._initOctopusDraft();
     if (!provider || provider !== this._octopusDraft.provider) this._octopusDraft.enabled = false;
     this._octopusDraft.provider = provider;
-    if (provider === "eon_next") this._octopusDraft.source = "native";
+    if (provider === "eon_next" || provider === "fuse") this._octopusDraft.source = "native";
     this._octopusPickerMountGen += 1;
   }
 
@@ -17905,11 +17931,12 @@ Reloading panel registration…
   _buildOctopusSavePayload() {
     if (!this._octopusDraft) return null;
     const d = this._octopusDraft;
-    const eon = d.provider === "eon_next";
+    const nativeOnly = d.provider === "eon_next" || d.provider === "fuse";
+    const enabled = Boolean(d.enabled) || d.provider === "fuse"; // Fuse's card has no switch: saving it turns it on
     return {
-      enabled: Boolean(d.enabled),
-      provider: d.enabled ? d.provider || "octopus" : d.provider || "",
-      source: !eon && d.source === "entity" ? "entity" : "native",
+      enabled,
+      provider: enabled ? d.provider || "octopus" : d.provider || "",
+      source: !nativeOnly && d.source === "entity" ? "entity" : "native",
       account_number: d.account_number || null,
       import_mpan: d.import_mpan || null,
       export_mpan: d.export_mpan || null,
@@ -17931,7 +17958,9 @@ Reloading panel registration…
     const payload = this._buildOctopusSavePayload();
     if (!payload) return;
     const label = energyProviderLabel(payload.provider);
-    if (payload.enabled && payload.provider === "eon_next") {
+    if (payload.provider === "fuse") {
+      // Signs in with a texted code on the card itself; nothing else to check
+    } else if (payload.enabled && payload.provider === "eon_next") {
       const d = this._octopusDraft;
       const hasToken = Boolean(payload.refresh_token || d.refresh_token_set);
       const hasLogin = Boolean(payload.email && (payload.password || d.password_set));
@@ -17965,7 +17994,11 @@ Reloading panel registration…
       this._octopusDraft.password = "";
       this._octopusDraft.refresh_token = "";
       this._initTariffDraft();
-      this._showToast(`${label} settings saved — schedule synced from API`);
+      const fuseErr = payload.provider === "fuse" ? this._plantState?.tariff?.fuse?.last_error : null;
+      this._showToast(
+        fuseErr ? `Fuse saved, but: ${fuseErr}` : `${label} settings saved — schedule synced from your tariff`,
+        fuseErr ? "err" : undefined
+      );
     } catch (err) {
       this._showToast(tariffSaveErrorMessage(err), "err");
       console.error(`FoxESS Plant: ${label} save failed`, err);
@@ -18078,6 +18111,58 @@ Reloading panel registration…
           ? `${label} rates refreshed (import ${impN}, export ${expN})${errHint}`
           : `${label} rates refreshed — daily schedule updated (import ${impN}, export ${expN})${errHint}`
       );
+    } catch (err) {
+      this._showToast(tariffSaveErrorMessage(err), "err");
+    } finally {
+      this._busy = false;
+      this._render();
+    }
+  }
+
+  /** Fuse sign-in steps (fuse_api.py): send code, sign in with it, fetch, sign out. */
+  async _fuseAction(action) {
+    const plant = this._getPlant();
+    if (!plant) return;
+    if (!this._fuseDraft) this._fuseDraft = { phone: "", code: "" };
+    const d = this._fuseDraft;
+    for (const key of ["phone", "code"]) {
+      const el = this._root.querySelector(`[data-field="fuse:${key}"]`);
+      if (el) d[key] = String(el.value || "").trim();
+    }
+    const msg = { plant_id: plant.entry_id };
+    if (action === "fuse-send-code") {
+      if (!d.phone) {
+        this._showToast("Enter the mobile number on your Fuse account", "err");
+        return;
+      }
+      Object.assign(msg, { type: "foxess_plant/fuse_send_code", phone: d.phone });
+    } else if (action === "fuse-verify-code") {
+      if (!/^\d{6}$/.test(d.code.replace(/\s/g, ""))) {
+        this._showToast("Enter the 6-digit code Fuse texted you", "err");
+        return;
+      }
+      Object.assign(msg, { type: "foxess_plant/fuse_verify_code", code: d.code });
+    } else {
+      msg.type = action === "fuse-fetch" ? "foxess_plant/fuse_fetch" : "foxess_plant/fuse_sign_out";
+    }
+    this._busy = true;
+    this._render();
+    try {
+      const state = await this._hass.connection.sendMessagePromise(msg);
+      if (state) this._plantState = state;
+      const fuse = this._plantState?.tariff?.fuse ?? {};
+      if (action === "fuse-send-code") {
+        d.code = "";
+        this._showToast("Code sent — check your phone");
+      } else if (action === "fuse-verify-code") {
+        d.code = "";
+        d.phone = "";
+        this._showToast(fuse.last_error ? `Signed in, but: ${fuse.last_error}` : "Signed in to Fuse — tariff read", fuse.last_error ? "err" : undefined);
+      } else if (action === "fuse-fetch") {
+        this._showToast(fuse.last_error ? `Fuse: ${fuse.last_error}` : "Fuse tariff read", fuse.last_error ? "err" : undefined);
+      } else {
+        this._showToast("Signed out of Fuse — the saved rates stay in use");
+      }
     } catch (err) {
       this._showToast(tariffSaveErrorMessage(err), "err");
     } finally {
@@ -19360,6 +19445,10 @@ Reloading panel registration…
       await this._fetchOctopusRates();
       return;
     }
+    if (action === "fuse-send-code" || action === "fuse-verify-code" || action === "fuse-fetch" || action === "fuse-sign-out") {
+      await this._fuseAction(action);
+      return;
+    }
     if (action === "apply-octopus-schedule") {
       await this._applyOctopusSchedule();
       return;
@@ -19756,7 +19845,7 @@ Reloading panel registration…
         if (kind === "import_provider") {
           // A supplier connects through its card; a sensor or the bands price import directly
           const choice = el.value;
-          const supplier = choice === "octopus" || choice === "eon_next" ? choice : "";
+          const supplier = TARIFF_SUPPLIERS.includes(choice) ? choice : "";
           this._applyTariffSupplierChoice(supplier);
           this._tariffDraft.import_source = choice === "entity" ? "entity" : "schedule";
           this._tariffDraft.export_provider = normalizeTariffExportProvider(
@@ -19876,6 +19965,12 @@ Reloading panel registration…
 
   _handleInput(e) {
     const el = e.target;
+    if (el?.dataset?.field?.startsWith("fuse:")) {
+      // Kept in a draft so a background render doesn't wipe a half-typed number or code
+      if (!this._fuseDraft) this._fuseDraft = { phone: "", code: "" };
+      this._fuseDraft[el.dataset.field.slice(5)] = el.value;
+      return;
+    }
     if (el?.dataset?.action === "pick-google-weather-entry") {
       if (!this._stormDraft) return;
       this._applyGoogleWeatherEntry(el.value || null);
@@ -25441,7 +25536,102 @@ ${effectiveBits.length ? `<p class="field-hint" style="margin:0 0 8px">Effective
 ${this._renderTariffImportCard(entities, currency)}
 ${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
 ${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
+${showFuseTariffProvider(this._tariffDraft) ? this._renderFuseSettings() : ""}
 ${this._renderTariffExportCard(entities, currency)}`;
+  }
+
+  /** Fuse sign-in, shared by the Import supplier card and the Export card: number → Send Code → code → Sign In. */
+  _renderFuseSignIn() {
+    const live = this._plantState?.tariff?.fuse ?? {};
+    if (!this._fuseDraft) this._fuseDraft = { phone: "", code: "" };
+    const d = this._fuseDraft;
+    const busy = this._busy ? "disabled" : "";
+    if (live.signed_in) {
+      const since = live.signed_in_at ? ` since ${formatSolcastTimestamp(live.signed_in_at)}` : "";
+      return `<p class="field-hint" style="margin:0 0 8px">Signed in to Fuse as ${esc(live.phone || "your account")}${esc(since)}. Fox Plant stays signed in, re-reads your tariff every week and again when your Fuse contract changes.</p>
+<div class="btn-row">
+<button type="button" class="btn btn-secondary" data-action="fuse-fetch" ${busy}>Fetch Rates Now</button>
+<button type="button" class="btn btn-secondary" data-action="fuse-sign-out" ${busy}>Sign Out</button>
+</div>`;
+    }
+    const intro = live.auth_failed
+      ? `<p class="field-hint" style="color:var(--fp-amber)">Fuse signed Fox Plant out. Sign in again below — the saved rates stay in use meanwhile.</p>`
+      : `<p class="field-hint">Fuse has no API keys, so Fox Plant signs in the way the Fuse website does: enter the mobile number on your Fuse account, press Send Code, then type in the code Fuse texts you. You normally only do this once.</p>`;
+    const codeStep = live.code_sent
+      ? `<div class="field"><label>Code From Fuse</label>
+<input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" data-field="fuse:code" value="${esc(d.code)}" placeholder="6-digit code" ${busy}>
+<p class="field-hint">Texted to ${esc(live.phone || "your phone")}. It expires after a few minutes — Send A New Code if it does.</p>
+</div>`
+      : "";
+    return `${intro}
+<div class="field"><label>Mobile Number</label>
+<input type="tel" autocomplete="tel" data-field="fuse:phone" value="${esc(d.phone)}" placeholder="07700 900123" ${busy}>
+</div>
+${codeStep}
+<div class="btn-row">
+<button type="button" class="btn ${live.code_sent ? "btn-secondary" : "btn-primary"}" data-action="fuse-send-code" ${busy}>${live.code_sent ? "Send A New Code" : "Send Code"}</button>
+${live.code_sent ? `<button type="button" class="btn btn-primary" data-action="fuse-verify-code" ${busy}>Sign In</button>` : ""}
+</div>`;
+  }
+
+  /** What Fox Plant read for one Fuse supply ("ELEC_IMPORT" / "ELEC_EXPORT"). */
+  _fuseTariffLines(kind, currency) {
+    const t = this._plantState?.tariff?.fuse?.tariffs?.[kind];
+    if (!t) return [];
+    const lines = [`${kind === "ELEC_EXPORT" ? "Export" : "Import"} tariff: ${t.name}`];
+    const multi = (t.rates || []).length > 1;
+    for (const r of t.rates || []) {
+      const hours = r.windows ? ` (${r.windows.map(([a, b]) => `${a}–${b}`).join(", ")})` : multi ? " (all other hours)" : "";
+      lines.push(`${multi ? `${r.name} rate` : "Unit rate"}: ${formatTariffMoney(r.p_per_kwh, currency)}/kWh${hours}`);
+    }
+    if (kind === "ELEC_IMPORT" || t.standing_p_per_day) {
+      lines.push(`Standing charge: ${formatTariffMoney(t.standing_p_per_day || 0, currency)}/day`);
+    }
+    if (t.start_date || t.end_date) {
+      lines.push(
+        `Contract: ${formatUkDate(t.start_date) || "—"} – ${t.end_date ? formatUkDate(t.end_date) : "open-ended"}${t.fixed ? " (fixed)" : ""}`
+      );
+    }
+    if (t.ended) {
+      lines.push("Contract ended — Fox Plant checks Fuse daily for the new prices and keeps using these until then");
+    } else if (t.next_update_date) {
+      const why = t.next_update_reason === "PRICE_CAP" ? " (price cap)" : "";
+      lines.push(
+        `Next price change: ${formatUkDate(t.next_update_date)}${why} — Fox Plant reads the new prices then; SmartCharge plans with these until then`
+      );
+    }
+    return lines;
+  }
+
+  _fuseFetchLines(live) {
+    const lines = [];
+    if (live.last_fetch_at) lines.push(`Last read from Fuse: ${formatSolcastTimestamp(live.last_fetch_at)}`);
+    if (live.last_error) lines.push(`Error: ${live.last_error}`);
+    return lines;
+  }
+
+  /** Import supplier card for Fuse (the sign-in is shared with the Export card). */
+  _renderFuseSettings() {
+    if (!this._octopusDraft) this._initOctopusDraft();
+    const live = this._plantState?.tariff?.fuse ?? {};
+    const dyn = this._plantState?.tariff?.dynamic ?? {};
+    const currency = tariffCurrencyFromTariff(this._plantState?.tariff ?? {});
+    const busy = this._busy ? "disabled" : "";
+    const saved = dyn.provider === "fuse" && dyn.enabled;
+    const lines = [...this._fuseTariffLines("ELEC_IMPORT", currency)];
+    if (live.last_fetch_at && !live.tariffs?.ELEC_IMPORT && !live.last_error) {
+      lines.push("No import supply on this Fuse account");
+    }
+    if (this._tariffDraft?.export_provider === "same") lines.push(...this._fuseTariffLines("ELEC_EXPORT", currency));
+    lines.push(...this._fuseFetchLines(live));
+    if (!saved) lines.push("Not saved yet — press Save Fuse to use Fuse for import.");
+    return `<div class="card">
+<p class="card-title">Fuse</p>
+<p class="field-hint" style="margin:0 0 12px">Reads your Fuse tariff — unit rates, the hours each applies, standing charge and contract dates — and syncs the daily schedule, so SmartCharge plans against it.</p>
+${this._renderFuseSignIn()}
+${saved ? "" : `<div class="btn-row"><button type="button" class="btn btn-primary" data-action="save-octopus-settings" ${busy}>Save Fuse</button></div>`}
+${lines.length ? `<p class="field-hint" style="margin:12px 0 0">${lines.map((l) => esc(l)).join("<br>")}</p>` : ""}
+</div>`;
   }
 
   /** A Home Assistant sensor field for import / export price, with what it reads now. */
@@ -25502,7 +25692,8 @@ ${provider === "entity" ? this._renderTariffEntityField("import", entities.impor
     const options = tariffExportProviderOptions(importProvider)
       .map(({ id, label }) => `<option value="${esc(id)}" ${provider === id ? "selected" : ""}>${esc(label)}</option>`)
       .join("");
-    const supplier = provider === "octopus" || provider === "eon_next";
+    const supplier = TARIFF_SUPPLIERS.includes(provider);
+    const fuse = provider === "fuse";
     const hint =
       provider === "same"
         ? `Export rates come from the export meter on your ${energyProviderLabel(importProvider)} account.`
@@ -25512,7 +25703,15 @@ ${provider === "entity" ? this._renderTariffEntityField("import", entities.impor
             ? "A sensor that reports your export price (its upcoming rates too, if it lists them)."
             : `Export from a different supplier than import: sign in to ${energyProviderLabel(provider)} here. Only its export meter is used.`;
     const statusLines = [];
-    if (savedProvider === provider && provider !== "same") {
+    if (fuse) {
+      const fuseLive = this._plantState?.tariff?.fuse ?? {};
+      statusLines.push(...this._fuseTariffLines("ELEC_EXPORT", currency));
+      if (fuseLive.last_fetch_at && !fuseLive.tariffs?.ELEC_EXPORT && !fuseLive.last_error) {
+        statusLines.push("No export supply on this Fuse account");
+      }
+      statusLines.push(...this._fuseFetchLines(fuseLive));
+      if (savedProvider !== "fuse") statusLines.push("Not saved yet — press Save Export.");
+    } else if (savedProvider === provider && provider !== "same") {
       if (live.export_tariff_code) statusLines.push(`Export tariff: ${live.export_tariff_code}`);
       if (live.current_export_p_per_kwh != null) {
         statusLines.push(`Current: ${formatTariffMoney(live.current_export_p_per_kwh, currency)}/kWh`);
@@ -25534,7 +25733,7 @@ ${provider === "entity" ? this._renderTariffEntityField("import", entities.impor
 ${provider === "entity" ? this._renderTariffEntityField("export", entities.export, currency) : ""}
 ${supplier ? this._renderExportSupplierFields(provider, live) : ""}
 <div class="btn-row">
-${supplier ? `<button type="button" class="btn btn-secondary" data-action="test-export-supplier" ${busy}>Test Connection</button>` : ""}
+${supplier && !fuse ? `<button type="button" class="btn btn-secondary" data-action="test-export-supplier" ${busy}>Test Connection</button>` : ""}
 <button type="button" class="btn btn-primary" data-action="save-tariff-export" ${busy}>Save Export</button>
 </div>
 ${statusLines.length ? `<p class="field-hint" style="margin:12px 0 0">${statusLines.map((l) => esc(l)).join("<br>")}</p>` : ""}
@@ -25543,6 +25742,7 @@ ${statusLines.length ? `<p class="field-hint" style="margin:12px 0 0">${statusLi
 
   /** Login for an export-only supplier (import is elsewhere). */
   _renderExportSupplierFields(provider, live) {
+    if (provider === "fuse") return this._renderFuseSignIn();
     const d = this._exportSupplierDraft;
     const busy = this._busy ? "disabled" : "";
     const meters = (this._exportSupplierMeters ?? live.export_meters ?? []).filter(Boolean);
