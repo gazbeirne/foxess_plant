@@ -140,6 +140,58 @@ def last_poll_timestamp(
     return latest
 
 
+def last_try_timestamp(
+    solcast: SolcastConfig,
+    cache: dict[str, Any],
+) -> datetime | None:
+    """Latest request sent to Solcast, successful or not.
+
+    Polls are spaced from this, so a failed request waits a full interval before the next try
+    instead of being retried on every 5-minute timer tick.
+    """
+    last = last_poll_timestamp(solcast, cache)
+    attempt = dt_util.parse_datetime(solcast.last_attempt_at) if solcast.last_attempt_at else None
+    if attempt is not None:
+        attempt = dt_util.as_utc(attempt) if attempt.tzinfo else attempt.replace(tzinfo=dt_util.UTC)
+        if last is None or attempt > last:
+            return attempt
+    return last
+
+
+def is_quota_exhausted(err: SolcastApiError) -> bool:
+    """A 429 whose body says the daily limit is spent ("TooManyRequests" / "exceeded").
+
+    Any other 429 (e.g. an empty body) means Solcast is busy: retry at the normal poll spacing.
+    """
+    text = str(err).lower()
+    return err.status == 429 and ("toomanyrequests" in text or "exceeded" in text)
+
+
+def mark_daily_limit_reached(solcast: SolcastConfig) -> None:
+    """Solcast says the daily limit is spent: treat today's quota as used up until the UTC reset."""
+    reset_api_quota_if_needed(solcast)
+    solcast.api_used_today = max(solcast.api_used_today, solcast.api_limit)
+
+
+STALE_CHECK_HOUR = 15
+
+
+def forecast_is_stale(forecast_end: datetime | None, now: datetime, *, ever_fetched: bool) -> bool:
+    """True when the PV forecast doesn't reach the next 15:00 local.
+
+    Every successful poll covers until the end of tomorrow, so this only trips when a whole
+    day's polls failed — e.g. by 15:00 nothing was fetched today, and tonight's SmartCharge plan
+    would have to guess tomorrow's PV. A plant that has never fetched isn't flagged.
+    """
+    if forecast_end is None:
+        return ever_fetched
+    local = dt_util.as_local(now)
+    need = local.replace(hour=STALE_CHECK_HOUR, minute=0, second=0, microsecond=0)
+    if need <= local:
+        need += timedelta(days=1)
+    return forecast_end < need
+
+
 def poll_interval_elapsed(
     hass: HomeAssistant,
     solcast: SolcastConfig,
@@ -147,8 +199,8 @@ def poll_interval_elapsed(
     *,
     pv_calls: int = 1,
 ) -> bool:
-    """True when the configured spacing since the last poll has passed."""
-    last = last_poll_timestamp(solcast, cache)
+    """True when the configured spacing since the last poll (or failed try) has passed."""
+    last = last_try_timestamp(solcast, cache)
     if last is None:
         return True
     return dt_util.utcnow() - last >= min_poll_interval(hass, solcast, pv_calls=pv_calls)
@@ -243,7 +295,7 @@ def solcast_next_fetch(
         return {"at": None, "status": "outside_window"}
 
     interval = min_poll_interval(hass, solcast, pv_calls=pv_calls)
-    last = last_poll_timestamp(solcast, cache)
+    last = last_try_timestamp(solcast, cache)
     now = dt_util.utcnow()
     if last is None or last + interval <= now:
         return {"at": now.isoformat(), "status": "due_now"}
@@ -338,14 +390,18 @@ async def _fetch_rooftop_pv_forecasts(
     hass: HomeAssistant,
     plant: PlantConfig,
     client: SolcastApiClient,
-) -> tuple[dict[str, Any] | None, list[str], dict[str, dict[str, Any]]]:
-    """Fetch forecasts via hobbyist GET /rooftop_sites/{resource_id}/forecasts."""
+) -> tuple[dict[str, Any] | None, list[str], dict[str, dict[str, Any]], int, bool]:
+    """Fetch forecasts via hobbyist GET /rooftop_sites/{resource_id}/forecasts.
+
+    Returns (parsed, errors, raw by resource id, requests Solcast answered, daily limit spent).
+    Stops at the first 429: the other sites would be refused too.
+    """
     from .solcast_hobbyist import async_resolve_rooftop_bindings
 
     solcast = plant.solcast
     requests = build_rooftop_pv_requests(plant.pv_config)
     if not requests:
-        return None, ["No enabled PV strings in PV Configuration"], {}
+        return None, ["No enabled PV strings in PV Configuration"], {}, 0, False
 
     if not solcast.rooftop_site_bindings:
         await async_resolve_rooftop_bindings(hass, plant)
@@ -357,6 +413,8 @@ async def _fetch_rooftop_pv_forecasts(
     payloads: list[tuple[str, dict[str, Any]]] = []
     errors: list[str] = []
     fetched_by_rid: dict[str, dict[str, Any]] = {}
+    answered = 0
+    rate_limited = False
 
     for req in requests:
         resource_id = bindings.get(req.label)
@@ -373,14 +431,20 @@ async def _fetch_rooftop_pv_forecasts(
                     hours=hours,
                     period=period,
                 )
+                answered += 1
             payloads.append((req.label, fetched_by_rid[resource_id]))
         except SolcastApiError as err:
+            if err.status is not None:
+                answered += 1
             msg = f"{req.label}: {err}"
             errors.append(msg)
             _LOGGER.warning("Solcast hobbyist forecast failed for %s: %s", req.label, err)
+            if err.status == 429:
+                rate_limited = is_quota_exhausted(err)
+                break
     if not payloads:
-        return None, errors, fetched_by_rid
-    return parse_detailed_forecast(payloads, hass), errors, fetched_by_rid
+        return None, errors, fetched_by_rid, answered, rate_limited
+    return parse_detailed_forecast(payloads, hass), errors, fetched_by_rid, answered, rate_limited
 
 
 async def async_refresh_solcast(
@@ -437,18 +501,24 @@ async def async_refresh_solcast(
         return cache
 
     client = SolcastApiClient(hass, api_key=solcast.api_key or "")
+    # Recorded before the request, so even an unexpected failure waits a full interval to retry
+    solcast.last_attempt_at = dt_util.utcnow().isoformat()
     try:
-        parsed, fetch_errors, raw_forecasts = await _fetch_rooftop_pv_forecasts(
-            hass, plant, client
+        parsed, fetch_errors, raw_forecasts, answered, rate_limited = (
+            await _fetch_rooftop_pv_forecasts(hass, plant, client)
         )
     except SolcastApiError as err:
         solcast.last_error = str(err)
         _LOGGER.warning("Solcast PV forecast fetch failed: %s", err)
         return cache
 
+    # Solcast counts every request it answers against the daily limit, failed or not
+    record_api_use(solcast, answered)
+    if rate_limited:
+        mark_daily_limit_reached(solcast)
+
     period_count = int(parsed.get("period_count", 0) or 0) if parsed else 0
     if parsed and period_count > 0:
-        record_api_use(solcast, pv_calls)
         cache["pv_forecast_parsed"] = parsed
         cache["raw_forecasts"] = raw_forecasts
         cache["pv_forecast_fetched_at"] = dt_util.utcnow().isoformat()
@@ -457,6 +527,11 @@ async def async_refresh_solcast(
         cache["updated_at"] = dt_util.utcnow().isoformat()
         solcast.last_fetch_at = cache["updated_at"]
         solcast.last_error = None
+    elif rate_limited:
+        solcast.last_error = (
+            f"{fetch_errors[0]} — Solcast says the daily limit is used up; "
+            "no more tries until it resets at 00:00 UTC"
+        )
     elif fetch_errors:
         solcast.last_error = fetch_errors[0] if len(fetch_errors) == 1 else "; ".join(fetch_errors[:2])
     elif parsed is not None:

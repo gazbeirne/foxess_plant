@@ -41,7 +41,11 @@ DEFAULT_FORECAST_OUTPUT = (
 
 
 class SolcastApiError(Exception):
-    """Solcast API request failed."""
+    """Solcast API request failed. ``status`` is the HTTP status, or None when no response came back."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class SolcastApiClient:
@@ -78,7 +82,7 @@ class SolcastApiClient:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     if not isinstance(data, dict):
-                        raise SolcastApiError("Unexpected Solcast response shape")
+                        raise SolcastApiError("Unexpected Solcast response shape", status=resp.status)
                     return data
                 if (
                     resp.status == 400
@@ -89,7 +93,7 @@ class SolcastApiClient:
                     retry = dict(query)
                     retry["output_parameters"] = ",".join(fallback_output)
                     return await self._request(path, retry, fallback_output=None)
-                raise SolcastApiError(f"Solcast HTTP {resp.status}: {body[:240]}")
+                raise SolcastApiError(f"Solcast HTTP {resp.status}: {body[:240]}", status=resp.status)
         except aiohttp.ClientError as err:
             raise SolcastApiError(str(err)) from err
 
