@@ -109,6 +109,33 @@ def test_config_defaults_and_unknown_models_dropped() -> None:
     assert cfg.primary == "solcast" and cfg.models == ["gfs_seamless"]
 
 
+def test_chart_points_one_per_hour_at_mid_hour() -> None:
+    end = datetime(2026, 10, 14, 12, tzinfo=UTC)
+    rows = om.blend_rows({"a": {int(end.timestamp()): 2.0}}, {}, ["a"], now=end)
+    points = om.chart_points(rows)
+    assert points == [{"t": round((end - timedelta(minutes=30)).timestamp() * 1000), "v": rows[0]["pv_estimate"]}]
+
+
+def test_history_keeps_past_days_frozen_and_today_live() -> None:
+    from datetime import date
+
+    tz = timezone.utc
+    today = date(2026, 10, 14)
+
+    def pts(day: date, kw: float) -> list[dict]:
+        start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+        return [{"t": (start + timedelta(hours=h, minutes=30)).timestamp() * 1000, "v": kw} for h in range(24)]
+
+    history = {"2026-10-12": [[1.0, 9.9]], "2026-09-01": [[1.0, 1.0]]}
+    new = om.update_history(history, pts(date(2026, 10, 12), 5.0) + pts(today, 2.0), today=today, tz=tz)
+    assert new["2026-10-12"] == [[1.0, 9.9]]  # two days back: frozen
+    assert len(new["2026-10-14"]) == 24  # today: from the latest blend
+    assert "2026-09-01" not in new  # older than HISTORY_DAYS
+    # A past day the live blend no longer covers comes from history
+    assert om.points_for_day([], new, date(2026, 10, 12), tz) == [{"t": 1.0, "v": 9.9}]
+    assert len(om.points_for_day(pts(today, 3.0), new, today, tz)) == 24
+
+
 def test_daily_kwh_needs_a_whole_day() -> None:
     tz = timezone.utc
     start = datetime(2026, 10, 14, 1, tzinfo=UTC)

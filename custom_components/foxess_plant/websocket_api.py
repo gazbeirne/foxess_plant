@@ -62,6 +62,7 @@ WS_TYPE_TARIFF_ENTITY_CANDIDATES = "foxess_plant/tariff_entity_candidates"
 WS_TYPE_UPDATE_SOLCAST = "foxess_plant/update_solcast"
 WS_TYPE_TEST_SOLCAST = "foxess_plant/test_solcast"
 WS_TYPE_UPDATE_OPEN_METEO = "foxess_plant/update_open_meteo"
+WS_TYPE_OPEN_METEO_POINTS = "foxess_plant/open_meteo_points"
 WS_TYPE_UPDATE_GLOW = "foxess_plant/update_glow"
 WS_TYPE_TEST_GLOW = "foxess_plant/test_glow"
 WS_TYPE_UPDATE_FOX_CLOUD = "foxess_plant/update_fox_cloud"
@@ -1685,7 +1686,36 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
                 "solcast_enabled": True,
                 "day": target_day.isoformat(),
             }
+        # Open-Meteo blend next to Solcast, so the chart still shows a forecast when one provider fails
+        om_points = coordinator.open_meteo_points_for_day(target_day)
+        if om_points and isinstance(report.get("intraday"), dict):
+            report["intraday"]["open_meteo_power_kw"] = om_points
         connection.send_result(msg["id"], report)
+
+    @websocket_api.websocket_command(
+        {
+            vol.Required("type"): WS_TYPE_OPEN_METEO_POINTS,
+            vol.Required("plant_id"): str,
+            vol.Required("day"): str,
+        }
+    )
+    @websocket_api.async_response
+    async def ws_open_meteo_points(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict[str, Any],
+    ) -> None:
+        coordinator, err_code, err_msg = _get_coordinator(hass, msg.get("plant_id"))
+        if coordinator is None:
+            connection.send_error(msg["id"], err_code, err_msg)
+            return
+        target_day = dt_util.parse_date(str(msg["day"]))
+        if target_day is None:
+            connection.send_error(msg["id"], "invalid_day", "Invalid day (use YYYY-MM-DD)")
+            return
+        connection.send_result(
+            msg["id"], {"day": target_day.isoformat(), "points": coordinator.open_meteo_points_for_day(target_day)}
+        )
 
     websocket_api.async_register_command(hass, ws_plant_list)
     websocket_api.async_register_command(hass, ws_plant_state)
@@ -1713,6 +1743,7 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_update_solcast)
     websocket_api.async_register_command(hass, ws_test_solcast)
     websocket_api.async_register_command(hass, ws_update_open_meteo)
+    websocket_api.async_register_command(hass, ws_open_meteo_points)
     websocket_api.async_register_command(hass, ws_update_glow)
     websocket_api.async_register_command(hass, ws_test_glow)
     websocket_api.async_register_command(hass, ws_update_fox_cloud)

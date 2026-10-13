@@ -2088,12 +2088,42 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         score_error=None,
                     )
                     changed = True
+            if changed:
+                # Charts keep each day's blend after the live forecast has moved on
+                self._open_meteo_cache["history"] = om.update_history(
+                    self._open_meteo_cache.get("history") or {},
+                    om.chart_points(self._open_meteo_rows()),
+                    today=dt_util.now().date(),
+                    tz=local_tz(),
+                )
             self._save_open_meteo()
         if changed:
             await self.async_request_refresh()
 
+    def open_meteo_points_for_day(self, day: date) -> list[dict[str, float]]:
+        """Open-Meteo blend chart points (ms, kW) for one local day — [] when Open-Meteo is off."""
+        from . import open_meteo as om
+        from .smart_charge.engine import local_tz
+
+        if not self.plant.open_meteo.enabled:
+            return []
+        return om.points_for_day(
+            om.chart_points(self._open_meteo_rows()), self._open_meteo_cache.get("history") or {}, day, local_tz()
+        )
+
     async def _async_actual_daily_pv(self, start: date, end: date) -> dict[str, float]:
         """kWh per complete local day from the PV energy counters' hourly statistics (pv1 + pv2)."""
+        days = await self._async_daily_counter_kwh({"pv": ("pv1_energy_total", "pv2_energy_total")}, start, end)
+        return {d: v["pv"] for d, v in days.items() if v.get("pv") is not None}
+
+    async def _async_daily_counter_kwh(
+        self, groups: dict[str, tuple[str, ...]], start: date, end: date, *, min_hours: int = 22
+    ) -> dict[str, dict[str, float]]:
+        """{local day: {group: kWh}} from lifetime energy counters' hourly recorder statistics.
+
+        ``groups`` maps a name to entity-map keys summed together (e.g. pv1 + pv2). A group is left out of a
+        day the counters didn't cover for ``min_hours`` hours (a gap would understate it).
+        """
         from homeassistant.components.recorder import get_instance
         from homeassistant.util import dt as dt_util
 
@@ -2102,12 +2132,13 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         from .websocket_api import _fetch_statistics_points
 
         tz = local_tz()
-        ids: dict[str, float] = {}
-        for key in ("pv1_energy_total", "pv2_energy_total"):
-            entity_id = resolve_entity_id(self.hass, self.plant.entity_map, key, device_id=self.plant.device_id)
-            scale = {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0}.get((self._entity_unit(key) or "").strip())
-            if entity_id and scale:
-                ids[entity_id] = scale
+        ids: dict[str, tuple[str, float]] = {}
+        for name, keys in groups.items():
+            for key in keys:
+                entity_id = resolve_entity_id(self.hass, self.plant.entity_map, key, device_id=self.plant.device_id)
+                scale = {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0}.get((self._entity_unit(key) or "").strip())
+                if entity_id and scale:
+                    ids[entity_id] = (name, scale)
         if not ids:
             return {}
         begin = datetime.combine(start, datetime.min.time(), tz) - timedelta(hours=1)
@@ -2115,19 +2146,69 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         stats = await get_instance(self.hass).async_add_executor_job(
             _fetch_statistics_points, self.hass, begin, finish, list(ids), "hour", "sum"
         )
-        per_day: dict[str, float] = {}
-        hours: dict[str, set[float]] = {}
-        for entity_id, scale in ids.items():
+        totals: dict[tuple[str, str], float] = {}
+        hours: dict[tuple[str, str], set[float]] = {}
+        for entity_id, (name, scale) in ids.items():
             rows = stats.get(entity_id) or []
             for a, b in zip(rows, rows[1:]):
                 delta = (b["mean"] - a["mean"]) * scale
                 if b["start"] - a["start"] != 3600 or delta < 0 or delta > 50:
                     continue
                 day = dt_util.as_local(dt_util.utc_from_timestamp(b["start"])).astimezone(tz).date().isoformat()
-                per_day[day] = per_day.get(day, 0.0) + delta
-                hours.setdefault(day, set()).add(b["start"])
-        # Only days the counters covered in full (a gap would understate the day)
-        return {d: round(v, 2) for d, v in per_day.items() if len(hours.get(d, ())) >= 22}
+                totals[(day, name)] = totals.get((day, name), 0.0) + delta
+                hours.setdefault((day, name), set()).add(b["start"])
+        out: dict[str, dict[str, float]] = {}
+        for (day, name), value in totals.items():
+            if len(hours.get((day, name), ())) >= min_hours:
+                out.setdefault(day, {})[name] = round(value, 2)
+        return out
+
+    async def _async_repair_performance_savings(self, days: int = 21) -> None:
+        """Re-price days (and today so far) whose savings restarts inflated — see performance/repair.py."""
+        from homeassistant.util import dt as dt_util
+
+        from .performance.repair import _f as _f_float, repaired_financials
+        from .performance.sample import _octopus_rates_p_per_kwh
+
+        store = getattr(self, "_performance_store", None)
+        if store is None:
+            return
+        groups = {
+            "import": ("grid_consumption_energy_total",),
+            "export": ("feed_in_energy_total",),
+            "load": ("load_energy_total",),
+            "pv": ("pv1_energy_total", "pv2_energy_total"),
+        }
+        today = dt_util.now().date()
+        start = today - timedelta(days=days)
+        complete = await self._async_daily_counter_kwh(groups, start, today)
+        imp_p, exp_p = _octopus_rates_p_per_kwh(self)
+        fixed: list[str] = []
+        for row in store.list_ledger_between(start.isoformat(), (today - timedelta(days=1)).isoformat()):
+            actual = complete.get(row["date"])
+            if not actual:
+                continue
+            patch = repaired_financials(row, actual, fallback_import_p=imp_p, fallback_export_p=exp_p)
+            pv = actual.get("pv")
+            if pv is not None and _f_float(row.get("pv_kwh")) < pv * 0.5 - 0.5:
+                patch = {**(patch or {}), "pv_kwh": pv}
+            if patch:
+                store.upsert_daily_ledger({**row, **patch})
+                fixed.append(f"{row['date']} → £{patch.get('net_daily_savings_gbp', row.get('net_daily_savings_gbp'))}")
+        # Today so far: hours since midnight, whatever has been recorded
+        elapsed = max(1, int((dt_util.now() - dt_util.start_of_local_day()).total_seconds() // 3600) - 1)
+        so_far = (await self._async_daily_counter_kwh(groups, today, today + timedelta(days=1), min_hours=elapsed)).get(
+            today.isoformat()
+        )
+        acc = getattr(self, "_performance_daily", None)
+        if so_far and acc:
+            patch = repaired_financials(acc, so_far, fallback_import_p=imp_p, fallback_export_p=exp_p)
+            if patch:
+                acc.update({k: v for k, v in patch.items() if k != "net_daily_savings_gbp"})
+                store.save_day_state(today.isoformat(), acc)
+                fixed.append(f"today → £{patch['net_daily_savings_gbp']}")
+        if fixed:
+            _LOGGER.warning("Re-priced savings inflated by restarts: %s", ", ".join(fixed))
 
     def _open_meteo_rows(self) -> list[dict[str, Any]]:
         from homeassistant.util import dt as dt_util
@@ -2139,6 +2220,39 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not cfg.enabled or not forecast:
             return []
         return blend_rows(forecast, self._open_meteo_cache.get("scores") or {}, list(cfg.models), now=dt_util.utcnow())
+
+    def pv_forecast_now(self) -> tuple[float | None, float | None]:
+        """(forecast PV kW now, forecast kWh for today) for the performance samples.
+
+        Solcast while it's updating; otherwise the Open-Meteo blend (a stale Solcast cache reads 0 kW,
+        which drew a flat forecast line and fed 0 W/m² to the panel-temperature model).
+        """
+        from homeassistant.util import dt as dt_util
+
+        from .open_meteo import HALF_HOUR, _row_end
+
+        sc = self._solcast_state()
+        if self._solcast_fresh() or not self._open_meteo_rows():
+            kw = None
+            if sc.get("power_now_w") is not None:
+                kw = float(sc["power_now_w"]) / 1000.0
+            elif sc.get("pv_power_now_kw") is not None:
+                kw = float(sc["pv_power_now_kw"])
+            today = sc.get("forecast_today_kwh")
+            return kw, float(today) if today is not None else None
+        now = dt_util.utcnow()
+        today_local = dt_util.now().date()
+        kw_now = None
+        today_kwh = 0.0
+        for row in self._open_meteo_rows():
+            end = _row_end(row)
+            if end is None:
+                continue
+            if end - HALF_HOUR <= now < end:
+                kw_now = float(row["pv_estimate"])
+            if dt_util.as_local(end - HALF_HOUR).date() == today_local:
+                today_kwh += float(row["pv_estimate"]) * 0.5
+        return kw_now, round(today_kwh, 2)
 
     def _solcast_fresh(self) -> bool:
         from homeassistant.util import dt as dt_util
@@ -2165,7 +2279,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         days = [(today + timedelta(days=i)).isoformat() for i in range(2)]
         totals = om.model_day_totals(cache.get("forecast") or {}, scores, models, tz)
         blend_daily: dict[str, float] = {}
-        for row in self._open_meteo_rows():
+        rows = self._open_meteo_rows()
+        for row in rows:
             end = dt_util.parse_datetime(row["period_end"])
             day = dt_util.as_local(end - om.HALF_HOUR).date().isoformat()
             blend_daily[day] = blend_daily.get(day, 0.0) + float(row["pv_estimate"]) * 0.5
@@ -2198,6 +2313,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for m in models
             ],
             "blend_day_kwh": {d: round(blend_daily[d], 1) if d in blend_daily else None for d in days},
+            # Yesterday → +2 days, for the Statistics chart's Open-Meteo line
+            "chart_points": om.chart_points(rows),
             "days": days,
             "solcast_fresh": self._solcast_fresh(),
         }
@@ -3690,6 +3807,10 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._performance_day != today:
                 self._performance_day = today
                 self._performance_daily = new_daily_accumulator()
+            try:
+                await self._async_repair_performance_savings()
+            except Exception as err:  # noqa: BLE001 — a repair must never stop performance tracking
+                _LOGGER.warning("Savings repair skipped: %s", err)
             self._setup_performance_timer()
             await async_performance_tick(self)
         except Exception as err:
@@ -5861,10 +5982,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             from .solcast_hobbyist import async_resolve_rooftop_bindings
 
             try:
-                await async_resolve_rooftop_bindings(self.hass, self.plant)
+                await async_resolve_rooftop_bindings(self.hass, self.plant, trigger="settings save", manual=True)
             except SolcastApiError as err:
                 # Solcast busy / limiting: the settings are saved; keep the sites already matched
                 if err.status != 429 or not self.plant.solcast.rooftop_site_bindings:
+                    self._persist_solcast_usage()  # keep the request log entry
                     raise HomeAssistantError(str(err)) from err
                 _LOGGER.warning("Solcast settings saved, but Solcast refused the site check: %s", err)
                 self.plant.solcast.last_error = f"Settings saved; site check refused by Solcast ({err})"
@@ -5892,6 +6014,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         test_result = await async_test_solcast_connection(
             self.hass, self.plant.solcast, plant=self.plant
         )
+        self._persist_solcast_usage()  # the test's request goes in the saved request log
         status = solcast_status_dict(
             self.plant.solcast,
             self._solcast_cache,

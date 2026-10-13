@@ -135,7 +135,7 @@ function normalizePanelView(view) {
 const SETTINGS_NAV = [
   { id: "main", label: "All" },
   { id: "fox-api", label: "Fox API" },
-  { id: "solcast", label: "Solar forecast" },
+  { id: "solcast", label: "Solar Forecast" },
   { id: "glow", label: "Glow meter" },
   { id: "tariff", label: "Tariff" },
   { id: "weather", label: "Weather" },
@@ -400,7 +400,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.505";
+const PANEL_VERSION = "0.9.509";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -1145,6 +1145,7 @@ function formatSolcastNextFetch(sc) {
   }
   const when = formatSolcastTimestamp(sc.next_fetch_at);
   if (status === "due_now") return `${when} (due now)`;
+  if (status === "paused") return `Paused after a day of refusals · next try ${when}`;
   if (status === "quota_exhausted") {
     const resetWhen = formatSolcastTimestamp(sc.next_fetch_reset_at || sc.next_fetch_at);
     const pollAt = sc.next_fetch_poll_at;
@@ -1433,22 +1434,32 @@ function mergeStatisticsForecastSeries(
   range,
   plantState,
   hass,
-  { dayOffset = 0, fallbackPoints = null, forecastState = null, serverForecastPoints = null } = {}
+  {
+    dayOffset = 0,
+    fallbackPoints = null,
+    forecastState = null,
+    serverForecastPoints = null,
+    openMeteoPoints = null,
+  } = {}
 ) {
   if (!Array.isArray(series) || !range) return series;
-  const without = series.filter((s) => s.id !== "forecast");
   if (dayOffset > 0) {
+    const without = series.filter((s) => s.id !== "forecast");
     const existing = series.find((s) => s.id === "forecast");
     return existing?.points?.length >= 2 ? series : without;
   }
+  // Today: both forecasts come from the latest plant state at every redraw (the chart's own data may have
+  // loaded before the plant state did, e.g. on the Overview)
+  const without = series.filter((s) => s.id !== "forecast" && s.id !== "forecast_om");
+  pushOpenMeteoSeries(without, range, openMeteoPoints);
   const fPoints = buildStatisticsForecastPoints(range, plantState, forecastState, hass, serverForecastPoints, {
     fallbackPoints,
   });
-  if (fPoints.length < 2) {
+  if (!hasForecastValues(fPoints)) {
     const existing = series.find((s) => s.id === "forecast");
-    if (existing?.points?.length >= 2) return series;
+    if (hasForecastValues(existing?.points)) return series;
     const serverOnly = filterStatisticsForecastServerPoints(serverForecastPoints, range);
-    if (serverOnly.length >= 2) {
+    if (hasForecastValues(serverOnly)) {
       return [
         ...without,
         { id: "forecast", ...FORECAST_CHART_STYLE, connectGaps: true, points: serverOnly },
@@ -1486,6 +1497,33 @@ async function fetchSolcastStatisticsForecastPoints(hass, plant) {
   }
 }
 
+/** Open-Meteo blend points (ms, kW) for a past local day; [] when Open-Meteo is off or has nothing. */
+async function fetchOpenMeteoDayPoints(hass, plant, dayOffset) {
+  if (!hass?.connection || !plant?.entry_id) return [];
+  const day = startOfLocalDay(new Date());
+  day.setDate(day.getDate() - dayOffset);
+  try {
+    const res = await hass.connection.sendMessagePromise({
+      type: "foxess_plant/open_meteo_points",
+      plant_id: plant.entry_id,
+      day: formatLocalDayKey(day),
+    });
+    return Array.isArray(res?.points) ? res.points : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Add the Open-Meteo line to a Statistics series list (its points clipped to the chart's day). */
+function pushOpenMeteoSeries(series, range, points) {
+  if (!Array.isArray(points) || !range) return;
+  const inRange = points
+    .filter((p) => Number.isFinite(p?.t) && Number.isFinite(p?.v) && p.t >= range.tMin && p.t <= range.tMax)
+    .map((p) => ({ t: p.t, v: p.v }))
+    .sort((a, b) => a.t - b.t);
+  if (inRange.length >= 2) series.push({ id: "forecast_om", ...OPEN_METEO_CHART_STYLE, connectGaps: true, points: inRange });
+}
+
 async function fetchHistoricalSolcastForecastPoints(hass, plant, dayOffset) {
   if (!hass?.connection || !plant?.entry_id || dayOffset <= 0) return [];
   const day = startOfLocalDay(new Date());
@@ -1511,7 +1549,8 @@ const FORECAST_ACCURACY_COLORS = {
   actual: "#19D4DE",
   predicted: "#FFD700",
   firstRevision: "rgba(255,215,0,0.42)",
-  latestRevision: "#FF8A3D",
+  // Solcast lines stay in the gold family; coral is Open-Meteo's
+  latestRevision: "#FFE680",
   cloud: "rgba(168,178,198,0.85)",
   cloudFill: "rgba(168,178,198,0.24)",
 };
@@ -1583,11 +1622,17 @@ function forecastAccuracyRangeFromReport(report, intraday) {
   return { tMin, tMax, nowMs, dayStart, isToday };
 }
 
+/** A forecast series worth drawing: ≥2 points and not all zero (a stale Solcast cache yields only zeros). */
+function hasForecastValues(points) {
+  return Array.isArray(points) && points.length >= 2 && points.some((p) => Number(p?.v) > 0.01);
+}
+
 function buildForecastAccuracySeriesMeta(intraday, { compact = false } = {}) {
   if (!intraday) return [];
   const meta = [];
   const add = (id, label, color, points, yAxis = "kw") => {
     if (!Array.isArray(points) || points.length < 2) return;
+    if (yAxis === "kw" && id !== "pv_actual" && !hasForecastValues(points)) return;
     meta.push({
       id,
       label,
@@ -1597,11 +1642,12 @@ function buildForecastAccuracySeriesMeta(intraday, { compact = false } = {}) {
     });
   };
   add("pv_actual", "PV generation", FORECAST_ACCURACY_COLORS.actual, intraday.actual_power_kw);
-  add("pv_forecast", "Forecast at the time", FORECAST_ACCURACY_COLORS.predicted, intraday.predicted_power_kw);
+  add("pv_forecast", "Solcast at the time", FORECAST_ACCURACY_COLORS.predicted, intraday.predicted_power_kw);
+  add("pv_open_meteo", "Open-Meteo", OPEN_METEO_CHART_COLOR, intraday.open_meteo_power_kw);
   if (!compact) {
     add(
       "pv_latest",
-      "Latest forecast PV",
+      "Latest Solcast",
       FORECAST_ACCURACY_COLORS.latestRevision,
       intraday.latest_revision_power_kw
     );
@@ -1748,7 +1794,8 @@ function forecastAccuracyClipCloudPoints(points, range) {
 function forecastAccuracyPlotSvg(series, range, options = {}) {
   const {
     height = 160,
-    width = 1000,
+    // Real on-screen width on phones (like the Statistics chart), else a 1000-wide chart shrinks to a sliver
+    width = chartRenderWidth(1000),
     pad = { l: 46, r: 8, t: 8, b: 28 },
     yUnit = "kWh",
     yMinZero = true,
@@ -1782,7 +1829,9 @@ function forecastAccuracyPlotSvg(series, range, options = {}) {
     return plotPad.t + inset + plotH - (Math.min(100, Math.max(0, Number(v))) / 100) * plotH;
   };
   const yTicks = forecastAccuracyYTicks(yMin, yMax);
-  const xTicks = forecastAccuracyXTicks(tMin, tMax);
+  // Narrow charts: keep every other time label (they overlap at phone width)
+  const xTicksAll = forecastAccuracyXTicks(tMin, tMax);
+  const xTicks = width < 600 && xTicksAll.length > 4 ? xTicksAll.filter((_, i) => i % 2 === 0) : xTicksAll;
   const grid = yTicks
     .map((yv) => {
       const y = yScale(yv);
@@ -1897,15 +1946,26 @@ function renderForecastAccuracyChartHtml(intraday, range, { compact = false } = 
     {
       id: "pv_forecast",
       // Each moment shows the forecast Solcast had then, so it steps when a new forecast arrives
-      label: "Forecast at the time",
+      label: "Solcast at the time",
       color: FORECAST_ACCURACY_COLORS.predicted,
       points: intraday?.predicted_power_kw,
     },
+    {
+      id: "pv_open_meteo",
+      label: "Open-Meteo",
+      color: OPEN_METEO_CHART_COLOR,
+      lineWidth: 1.6,
+      points: intraday?.open_meteo_power_kw,
+    },
   ];
-  if (!compact && intraday?.latest_revision_power_kw?.length >= 2) {
+  // Drop forecast lines with nothing in them (Solcast not updating), so the legend lists only what's drawn
+  for (let i = powerSeries.length - 1; i > 0; i -= 1) {
+    if (!hasForecastValues(powerSeries[i].points)) powerSeries.splice(i, 1);
+  }
+  if (!compact && hasForecastValues(intraday?.latest_revision_power_kw)) {
     powerSeries.push({
       id: "pv_latest",
-      label: "Latest forecast PV",
+      label: "Latest Solcast",
       color: FORECAST_ACCURACY_COLORS.latestRevision,
       dash: "5 4",
       lineWidth: 1.6,
@@ -1990,7 +2050,7 @@ function renderForecastAccuracyRevisionsTable(revisions) {
 
 function renderForecastAccuracyCard(report, { compact = false, loading = false, period = "day" } = {}) {
   if (period !== "day") return "";
-  const title = compact ? "Forecast vs production" : "Solar Forecast Accuracy";
+  const title = compact ? "Forecast vs Production" : "Solar Forecast Accuracy";
   const titleHtml = compact
     ? `<p class="card-title">${esc(title)}</p>`
     : `<h3 class="fox-analysis-summary-title fox-analysis-chart-title">${esc(title)}</h3>`;
@@ -2009,7 +2069,11 @@ ${titleHtml}
 <p class="forecast-accuracy-hint">Check FoxESS Plant is loaded, then refresh the page.</p>
 </div>`;
   }
-  if (!report.intraday?.actual_power_kw?.length && !report.intraday?.predicted_power_kw?.length) {
+  if (
+    !report.intraday?.actual_power_kw?.length &&
+    !report.intraday?.predicted_power_kw?.length &&
+    !report.intraday?.open_meteo_power_kw?.length
+  ) {
     return `<div class="card forecast-accuracy-card${compact ? " forecast-accuracy-card--compact" : ""}" style="${margin}">
 ${titleHtml}
 <p class="forecast-accuracy-empty">No forecast comparison data for this day yet.</p>
@@ -2039,13 +2103,31 @@ ${titleHtml}
   const range = forecastAccuracyRangeFromReport(report, report.intraday);
   const chart = renderForecastAccuracyChartHtml(report.intraday, range, { compact });
   const revisions = compact ? "" : renderForecastAccuracyRevisionsTable(report.revisions);
+  // Open-Meteo over the same part of the day as "Actual" (30-minute points at mid-period, kW)
+  const asOfMs = report.as_of ? Date.parse(report.as_of) : Date.now();
+  // (hourly points at mid-hour, kW → kWh per hour)
+  const omPts = report.intraday?.open_meteo_power_kw ?? [];
+  const omKwh = omPts.length >= 2
+    ? omPts.filter((p) => p.t + 30 * 60 * 1000 <= asOfMs).reduce((sum, p) => sum + Number(p.v), 0)
+    : null;
+  const omErr = omKwh != null && report.actual_kwh != null ? Number(report.actual_kwh) - omKwh : null;
+  const omStat = omKwh != null
+    ? `<div class="forecast-accuracy-stat"><label>Open-Meteo</label><strong>${esc(formatDailyKwh(omKwh))}</strong></div>`
+    : "";
+  const omErrStat = omErr != null
+    ? `<div class="forecast-accuracy-stat ${omErr >= 0 ? "forecast-accuracy-stat--high" : "forecast-accuracy-stat--low"}"><label>Open-Meteo Variance</label><strong>${esc(formatForecastSignedKwh(omErr))}</strong></div>`
+    : "";
+  // Solcast with no forecast for the day (e.g. refused by its API): show a dash, not "0 kWh" and a false variance
+  const solcastHas = hasForecastValues(report.intraday?.predicted_power_kw);
   return `<div class="card forecast-accuracy-card${compact ? " forecast-accuracy-card--compact" : ""}" style="${margin}" data-forecast-accuracy="1">
 ${titleHtml}
-<p class="forecast-accuracy-sub">${compact ? "Solcast revisions compared with measured solar output" : "Measured production vs Solcast predictions and intraday revisions"}</p>
+<p class="forecast-accuracy-sub">${compact ? "Forecasts compared with measured solar output" : "Measured production vs Solcast and Open-Meteo forecasts, with Solcast's intraday revisions"}</p>
 <div class="forecast-accuracy-stats">
 <div class="forecast-accuracy-stat"><label>Actual</label><strong>${esc(actual)}</strong></div>
-<div class="forecast-accuracy-stat"><label>Forecast</label><strong>${esc(predicted)}</strong></div>
-<div class="forecast-accuracy-stat ${errCls}"><label>Variance</label><strong>${esc(errText)}</strong></div>
+<div class="forecast-accuracy-stat"><label>Solcast</label><strong>${esc(solcastHas ? predicted : "—")}</strong></div>
+${omStat}
+${solcastHas ? `<div class="forecast-accuracy-stat ${errCls}"><label>Solcast Variance</label><strong>${esc(errText)}</strong></div>` : ""}
+${omErrStat}
 </div>
 ${revisionShift}${revisionHint}
 ${chart}
@@ -3759,7 +3841,7 @@ function renderPerformancePowerChartSvg(chart) {
   const limitText = hasLimit ? ` (${acLimit.toFixed(1)} kW${limitOnScale ? "" : ", above this scale"})` : "";
   const legend = `<div class="fox-perf-chart-legend">
 <span><i style="background:#19D4DE"></i> Solar output kW</span>
-${potential.length ? `<span><i style="background:#f5c542"></i> Solcast forecast</span>` : ""}
+${potential.length ? `<span><i style="background:#f5c542"></i> PV Forecast</span>` : ""}
 <span><i style="background:#2F6BFF"></i> Net grid kW</span>
 ${hasLimit ? `<span><i style="background:#f59e0b"></i> Inverter AC limit${esc(limitText)}</span>` : ""}
 ${hasClipping ? `<span><i style="background:#ef4444"></i> Clipping kW</span>` : ""}
@@ -3788,7 +3870,7 @@ ${lines}
     tMax: xDomain.tMax,
     series: [
       { label: "Solar output", color: "#19D4DE", unit: " kW", points: pv },
-      ...(potential.length ? [{ label: "Solcast forecast", color: "#f5c542", unit: " kW", points: potential }] : []),
+      ...(potential.length ? [{ label: "PV Forecast", color: "#f5c542", unit: " kW", points: potential }] : []),
       { label: "Net grid", color: "#2F6BFF", unit: " kW", points: grid },
       ...(hasClipping ? [{ label: "Clipping", color: "#ef4444", unit: " kW", points: clip }] : []),
     ],
@@ -7423,8 +7505,8 @@ const STATISTICS_CHART_SERIES = [
 ];
 
 const FORECAST_CHART_STYLE = {
-  label: "Forecast",
-  tooltipLabel: "Forecast",
+  label: "Solcast",
+  tooltipLabel: "Solcast",
   legendGroup: "forecast",
   color: "#FFD700",
   fillColor: "rgba(255,215,0,0.14)",
@@ -7432,14 +7514,27 @@ const FORECAST_CHART_STYLE = {
   lineWidth: 1.2,
 };
 
+/** Open-Meteo blend: same shaded style as Solcast's forecast, in coral. */
+const OPEN_METEO_CHART_COLOR = "#FF7A59";
+const OPEN_METEO_CHART_STYLE = {
+  label: "Open-Meteo",
+  tooltipLabel: "Open-Meteo",
+  legendGroup: "forecast_om",
+  color: OPEN_METEO_CHART_COLOR,
+  fillColor: "rgba(255,122,89,0.14)",
+  fill: true,
+  lineWidth: 1.2,
+};
+
 /** Consolidated top legend (one button toggles whole group). */
-const STATISTICS_LEGEND_ORDER = ["solar", "battery", "grid", "load", "forecast"];
+const STATISTICS_LEGEND_ORDER = ["solar", "battery", "grid", "load", "forecast", "forecast_om"];
 const STATISTICS_LEGEND_LABEL = {
   solar: "Solar",
   battery: "Battery",
   grid: "Grid",
   load: "Load",
-  forecast: "Forecast",
+  forecast: "Solcast",
+  forecast_om: "Open-Meteo",
 };
 const STATISTICS_LEGEND_COLORS = {
   solar: "#19D4DE",
@@ -7447,6 +7542,7 @@ const STATISTICS_LEGEND_COLORS = {
   grid: "#FF6FAF",
   load: "#8A4DFF",
   forecast: "#FFD700",
+  forecast_om: OPEN_METEO_CHART_COLOR,
 };
 
 /** Side legend groups (FoxCloud Energy Analysis layout). */
@@ -7464,7 +7560,10 @@ const STATISTICS_SIDE_LEGEND = {
     { group: "battery", label: "Battery Charge", color: "#C4A3FF" },
     { group: "load", label: "Total Load", color: "#8A4DFF" },
   ],
-  forecast: [{ group: "forecast", label: "Forecast", color: "#FFD700" }],
+  forecast: [
+    { group: "forecast", label: "Solcast", color: "#FFD700" },
+    { group: "forecast_om", label: "Open-Meteo", color: OPEN_METEO_CHART_COLOR },
+  ],
 };
 
 const STATISTICS_CHART_LAYOUT = {
@@ -10655,7 +10754,7 @@ async function fetchStatisticsChartSeries(hass, plant, plantState, { dayOffset =
       hass,
       serverForecastPoints
     );
-    if (fPoints.length >= 2) {
+    if (hasForecastValues(fPoints)) {
       series.push({
         id: "forecast",
         ...FORECAST_CHART_STYLE,
@@ -10663,11 +10762,15 @@ async function fetchStatisticsChartSeries(hass, plant, plantState, { dayOffset =
         points: fPoints,
       });
     }
+    pushOpenMeteoSeries(series, range, plantState?.open_meteo?.chart_points);
     return { series, socSeries, range, forecastState, dayOffset, serverForecastPoints };
   } else {
-    const fPoints = await fetchHistoricalSolcastForecastPoints(hass, plant, dayOffset);
+    const [fPoints, omPoints] = await Promise.all([
+      fetchHistoricalSolcastForecastPoints(hass, plant, dayOffset),
+      fetchOpenMeteoDayPoints(hass, plant, dayOffset),
+    ]);
     const inRange = fPoints.filter((p) => p.t >= range.tMin && p.t <= range.tMax);
-    if (inRange.length >= 2) {
+    if (hasForecastValues(inRange)) {
       series.push({
         id: "forecast",
         ...FORECAST_CHART_STYLE,
@@ -10675,6 +10778,7 @@ async function fetchStatisticsChartSeries(hass, plant, plantState, { dayOffset =
         points: inRange,
       });
     }
+    pushOpenMeteoSeries(series, range, omPoints);
   }
   if (!series.some((s) => s.points.length)) {
     const listed = specs.map((s) => s.entity_id).join(", ");
@@ -11270,7 +11374,7 @@ function renderStatisticsChartHtml(series, range, options = {}) {
   const xTicks = Array.from({ length: xTickCount }, (_, i) => tMin + i * xTickHours * 60 * 60 * 1000);
 
   const plotSeries = visible.map((s) => {
-    const isForecast = s.id === "forecast" || s.legendGroup === "forecast";
+    const isForecast = s.id === "forecast" || s.legendGroup === "forecast" || s.legendGroup === "forecast_om";
     const clipEnd = isForecast ? tMax : nowMs;
     const clipped = s.points.filter((p) => p.t >= tMin && p.t <= clipEnd);
     let segmentGroups;
@@ -16728,6 +16832,7 @@ Reloading panel registration…
         fallbackPoints: this._forecastFallbackPointsForStatistics(range),
         forecastState: chart.forecastState,
         serverForecastPoints: chart.serverForecastPoints,
+        openMeteoPoints: this._plantState?.open_meteo?.chart_points,
       }
     );
   }
@@ -24548,7 +24653,7 @@ ${note}${via}${forecastHint}${activeBadge}
 <div data-settings-live>${this._renderSettingsMainLiveHtml()}</div>
 <div data-settings-nav>
 ${renderListButton({ action: "settings-sub", sub: "fox-api" }, "Fox API", subs["fox-api"])}
-${renderListButton({ action: "settings-sub", sub: "solcast" }, "Solcast", subs.solcast)}
+${renderListButton({ action: "settings-sub", sub: "solcast" }, "Solar Forecast", subs.solcast)}
 ${renderListButton({ action: "settings-sub", sub: "glow" }, "Glow smart meter", subs.glow)}
 ${renderListButton({ action: "settings-sub", sub: "tariff" }, "Tariff", subs.tariff)}
 ${renderListButton({ action: "settings-sub", sub: "weather" }, "Weather", subs.weather)}
@@ -25674,7 +25779,7 @@ ${tile("Low-price slots", slots.length ? String(slots.length) : "None")}
 <p class="field-hint" style="margin:8px 0 0">Test connection lists your Home PV systems (does not use daily forecast quota).</p>`
       : "";
     return `<div class="card">
-<p class="card-title">API Credentials</p>
+<p class="card-title">Solcast · API Credentials</p>
 <p class="field-hint">Register a free <a class="field-link" href="${esc(SOLCAST_HOBBYIST_URL)}" target="_blank" rel="noopener noreferrer">Home PV System</a> account (10 API requests/day). All quota goes to PV forecasts — no weather calls.</p>
 <div class="toggle-row"><span><strong>Enable Solcast PV forecast</strong><br><span style="font-size:12px;color:var(--secondary-text-color)">Replaces a third-party Solcast integration for chart PV lines</span></span>
 <input type="checkbox" data-field="solcast:enabled" ${draft.enabled ? "checked" : ""} ${this._busy ? "disabled" : ""}></div>
@@ -25970,7 +26075,7 @@ ${detailBlock}
       ? `<p class="field-hint" style="margin-top:8px">All figures in kWh. <strong>Error</strong> is how far each model's forecast, made a day ahead, was from what your panels actually produced, on average over the last 30 days. The blend gives more weight to the more accurate models; until a model has ${esc(String(om.min_scored_days ?? 7))} scored days the models share equally.</p>`
       : `<p class="field-hint" style="margin-top:8px">All figures in kWh.</p>`;
     return `<div class="card">
-<p class="card-title">Forecast in use</p>
+<p class="card-title">Forecast In Use</p>
 <div class="entity-list">
 <div class="entity-row"><span class="entity-name">SmartCharge uses for tomorrow</span><span class="entity-value"><strong>${esc(inUse)}</strong></span></div>
 <div class="entity-row"><span class="entity-name">Solcast</span><span class="entity-value">${esc(solcastStatus)}</span></div>
@@ -25979,6 +26084,33 @@ ${detailBlock}
 ${table}
 ${scoringHint}
 </div>`;
+  }
+
+  /** Every Solcast request Fox Plant made (newest first): when, what, what started it, and Solcast's answer. */
+  _renderSolcastRequestLog(live) {
+    const log = Array.isArray(live?.request_log) ? [...live.request_log].reverse() : [];
+    const refusals = live?.refused_count
+      ? `<p class="field-hint" style="margin-top:8px">${esc(String(live.refused_count))} refusal${live.refused_count === 1 ? "" : "s"} since the last successful download${live.refused_since ? ` (first ${esc(formatSolcastTimestamp(live.refused_since))})` : ""}.</p>`
+      : "";
+    if (!log.length) {
+      return `${refusals}<p class="field-hint" style="margin-top:8px">No Solcast requests recorded yet. Every request Fox Plant makes is listed here.</p>`;
+    }
+    const rows = log
+      .map((e) => {
+        const ok = e.result === "OK";
+        const color = ok ? "" : e.result === "not sent" ? "var(--secondary-text-color)" : "var(--fp-amber, #f59e0b)";
+        const t = e.t ? new Date(e.t) : null;
+        const when = t && !Number.isNaN(t.getTime())
+          ? t.toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+          : "—";
+        return `<tr><td style="white-space:nowrap">${esc(when)}</td><td>${esc(e.what || "—")}</td><td>${esc(e.trigger || "—")}</td><td style="${color ? `color:${color}` : ""}">${esc(String(e.result ?? "—"))}</td></tr>`;
+      })
+      .join("");
+    return `${refusals}<p class="card-title" style="margin-top:16px">Request Log</p>
+<div class="octopus-greener-table-wrap"><table class="octopus-greener-table">
+<thead><tr><th>Time</th><th>Request</th><th>Started By</th><th>Result</th></tr></thead>
+<tbody>${rows}</tbody></table></div>
+<p class="field-hint" style="margin-top:6px">Every Solcast request goes through one place in Fox Plant, which records it here (last 30). Automatic requests are at least 10 minutes apart and stop for a day after a whole day of refusals.</p>`;
   }
 
   _renderOpenMeteoCard() {
@@ -26007,7 +26139,7 @@ ${scoringHint}
 <option value="solcast" ${d.primary === "solcast" ? "selected" : ""}>Solcast — Open-Meteo fills gaps and takes over when Solcast hasn't updated for 24 h</option>
 <option value="open_meteo" ${d.primary === "open_meteo" ? "selected" : ""}>Open-Meteo — Solcast only fills gaps</option>
 </select></div>
-<p class="card-title" style="margin-top:16px">Weather models</p>
+<p class="card-title" style="margin-top:16px">Weather Models</p>
 <p class="field-hint" style="margin:0 0 6px">Fetched together in one request per hour. Keep several: the blend is steadier than any single model.</p>
 ${models}
 <p class="field-hint" style="margin-top:12px">Location: <strong>${esc(loc)}</strong><br>Arrays (from PV Configuration):<br>${arrays || "Enable a PV string in PV Configuration"}</p>`
@@ -26066,11 +26198,11 @@ ${options}
     } else if (sched && draft.auto_update === "all_day") {
       scheduleHint = `<p class="field-hint">24 h mode: about <strong>${esc(String(sched.interval_minutes ?? "—"))}</strong> min between refreshes.</p>`;
     }
-    return `<header class="header"><h1>Solar forecast</h1><p>SmartCharge sizes the overnight grid charge from tomorrow's solar forecast. Use Solcast, Open-Meteo or both: Fox Plant compares them with what your panels actually produce and switches to Open-Meteo by itself when Solcast stops updating. Overview weather and StormSafe stay on Google Weather.</p></header>
+    return `<header class="header"><h1>Solar Forecast</h1><p>SmartCharge sizes the overnight grid charge from tomorrow's solar forecast. Use Solcast, Open-Meteo or both: Fox Plant compares them with what your panels actually produce and switches to Open-Meteo by itself when Solcast stops updating. Overview weather and StormSafe stay on Google Weather.</p></header>
 ${this._renderSolarForecastComparisonCard()}
 ${this._renderOpenMeteoCard()}
 <div class="card">
-<p class="card-title">Solcast · auto update</p>
+<p class="card-title">Solcast · Auto Update</p>
 <p class="field-hint" style="margin:0 0 8px"><a class="field-link" href="${esc(SOLCAST_API_DOCS_URL)}" target="_blank" rel="noopener noreferrer">Solcast hobbyist API</a> (free account, 10 requests a day).</p>
 <div class="field"><label>Schedule</label>
 <select data-field="solcast:auto_update" ${this._busy ? "disabled" : ""}>
@@ -26084,13 +26216,13 @@ ${scheduleHint}
 </div>
 ${this._renderSolcastApiCredentialsCard()}
 <div class="card">
-<p class="card-title">Rooftop tilt &amp; azimuth</p>
+<p class="card-title">Rooftop Tilt &amp; Azimuth</p>
 <p class="field-hint" style="margin:0">Used for each enabled PV string by Solcast and Open-Meteo. Panel count, wattage, and efficiency are under <strong>Settings → PV Configuration</strong>. Saved together when you press <strong>Save</strong> below.</p>
 ${this._renderPvTiltAzimuthFields("pv1", { allowWhenDisabled: true })}
 ${this._renderPvTiltAzimuthFields("pv2", { allowWhenDisabled: true })}
 </div>
 <div class="card">
-<p class="card-title">Solcast site location</p>
+<p class="card-title">Solcast Site Location</p>
 <p class="field-hint">Hobbyist accounts may register <strong>two</strong> rooftop sites on <a class="field-link" href="${esc(SOLCAST_ACCOUNT_LOCATIONS_URL)}" target="_blank" rel="noopener noreferrer">Solcast → Locations</a>. Enter the <strong>latitude and longitude exactly as shown there</strong> for the site you use. Do <strong>not</strong> copy Home Assistant home coordinates — extra decimal places will not match Solcast and API calls can fail or return the wrong site.</p>
 <div class="field"><label>Latitude <span class="field-required">*</span></label>
 <input type="number" step="0.0001" inputmode="decimal" data-field="solcast:latitude" value="${esc(String(draft.latitude))}" placeholder="e.g. -33.8568" ${this._busy ? "disabled" : ""} required></div>
@@ -26106,7 +26238,7 @@ ${this._renderPvTiltAzimuthFields("pv2", { allowWhenDisabled: true })}
 <input type="text" data-field="solcast:period" value="${esc(String(draft.period))}" readonly></div>
 </div>
 <div class="card">
-<p class="card-title">Solcast status</p>
+<p class="card-title">Solcast Status</p>
 <div class="entity-list">
 <div class="entity-row"><span class="entity-name">API used today</span><span class="entity-value">${esc(String(live.api_used_today ?? 0))} / ${esc(String(live.api_limit ?? draft.api_limit))}</span></div>
 <div class="entity-row"><span class="entity-name">Remaining today</span><span class="entity-value">${esc(String(live.api_remaining ?? "—"))}</span></div>
@@ -26124,6 +26256,7 @@ ${this._renderPvTiltAzimuthFields("pv2", { allowWhenDisabled: true })}
     )}</span></div>
 </div>
 <p class="field-hint" style="margin-top:8px"><strong>API groups</strong> (from PV config):<br>${pvReqLines}</p>
+${this._renderSolcastRequestLog(live)}
 <p class="field-hint">Diagnostic sensors expose <code>detailed_forecast</code> for automations — charts use plant state directly.</p>
 </div>
 <div class="btn-row">

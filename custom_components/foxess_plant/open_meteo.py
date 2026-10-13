@@ -297,6 +297,54 @@ def blend_rows(
     return rows
 
 
+HISTORY_DAYS = 14
+
+
+def chart_points(rows: list[dict[str, Any]]) -> list[dict[str, float]]:
+    """Blend rows → chart points {t: ms at the middle of each hour, v: kW}.
+
+    Open-Meteo is hourly; each hour becomes two equal half-hour rows for the planner. Charting both would
+    draw flat steps, so the chart gets one point per hour (from the row that ends on the hour).
+    """
+    out = []
+    for row in rows:
+        end = _row_end(row)
+        if end is None or end.minute != 0:
+            continue
+        out.append({"t": round((end - HALF_HOUR).timestamp() * 1000), "v": float(row["pv_estimate"])})
+    return sorted(out, key=lambda p: p["t"])
+
+
+def update_history(
+    history: dict[str, list[list[float]]], points: list[dict[str, float]], *, today: date, tz: tzinfo
+) -> dict[str, list[list[float]]]:
+    """Keep each local day's blend for the charts: today and yesterday follow the latest fetch, older days freeze.
+
+    Stored as {day ISO: [[ms, kW], ...]} for the last HISTORY_DAYS days.
+    """
+    by_day: dict[str, list[list[float]]] = {}
+    for p in points:
+        day = datetime.fromtimestamp(p["t"] / 1000, timezone.utc).astimezone(tz).date()
+        if today - timedelta(days=1) <= day <= today:
+            by_day.setdefault(day.isoformat(), []).append([p["t"], round(p["v"], 3)])
+    out = {**history, **by_day}
+    keep = {(today - timedelta(days=i)).isoformat() for i in range(HISTORY_DAYS)}
+    return {d: v for d, v in out.items() if d in keep}
+
+
+def points_for_day(
+    current: list[dict[str, float]], history: dict[str, list[list[float]]], day: date, tz: tzinfo
+) -> list[dict[str, float]]:
+    """Chart points for one local day: the current blend where it covers the day, else the stored history."""
+    start = datetime.combine(day, datetime.min.time(), tz).timestamp() * 1000
+    end = start + 86_400_000
+    live = [p for p in current if start <= p["t"] < end]
+    if len(live) >= 20:
+        return live
+    stored = history.get(day.isoformat()) or []
+    return [{"t": t, "v": v} for t, v in stored] or live
+
+
 def model_day_totals(
     forecast: dict[str, dict[int, float]], scores: dict[str, dict[str, Any]], models: list[str], tz: tzinfo
 ) -> dict[str, dict[str, float]]:

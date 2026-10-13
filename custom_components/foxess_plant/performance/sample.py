@@ -231,13 +231,11 @@ def collect_performance_sample(coordinator: Any) -> PerformanceSample:
     weather = read_weather_metrics(coordinator.hass, coordinator)
     coordinator._last_weather_sources = weather.get("sources")
 
+    # PV forecast for now and today: Solcast while it's updating, else Open-Meteo (see pv_forecast_now)
     solcast_kw = None
-    solcast_state = coordinator._solcast_state() if hasattr(coordinator, "_solcast_state") else {}
-    power_now_w = solcast_state.get("power_now_w")
-    if power_now_w is not None:
-        solcast_kw = float(power_now_w) / 1000.0
-    elif solcast_state.get("pv_power_now_kw") is not None:
-        solcast_kw = float(solcast_state["pv_power_now_kw"])
+    solcast_today = None
+    if hasattr(coordinator, "pv_forecast_now"):
+        solcast_kw, solcast_today = coordinator.pv_forecast_now()
 
     clipping = compute_clipping_loss_kw(
         pv_power_kw=pv_kw,
@@ -260,7 +258,6 @@ def collect_performance_sample(coordinator: Any) -> PerformanceSample:
 
     analytics = coordinator._read_analytics() if hasattr(coordinator, "_read_analytics") else {}
     pv_today = analytics.get("pv_production_kwh_today")
-    solcast_today = solcast_state.get("forecast_today_kwh")
 
     return PerformanceSample(
         pv_power_kw=pv_kw,

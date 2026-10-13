@@ -151,16 +151,20 @@ def _site_meta(site: dict[str, Any], label: str) -> dict[str, Any]:
     }
 
 
-async def async_list_rooftop_sites(hass: HomeAssistant, solcast: SolcastConfig) -> list[dict[str, Any]]:
+async def async_list_rooftop_sites(
+    hass: HomeAssistant, solcast: SolcastConfig, *, trigger: str = "site lookup", manual: bool = True
+) -> list[dict[str, Any]]:
     """List Home PV sites from the hobbyist toolkit (does not use daily API quota)."""
     if not solcast.api_key_configured():
         raise SolcastApiError("Solcast API key is not configured")
-    client = SolcastApiClient(hass, api_key=solcast.api_key or "")
+    client = SolcastApiClient(hass, api_key=solcast.api_key or "", solcast=solcast, trigger=trigger, manual=manual)
     payload = await client.list_rooftop_sites()
     return parse_rooftop_site_list(payload)
 
 
-async def async_resolve_rooftop_bindings(hass: HomeAssistant, plant: PlantConfig) -> dict[str, str]:
+async def async_resolve_rooftop_bindings(
+    hass: HomeAssistant, plant: PlantConfig, *, trigger: str = "settings save", manual: bool = True
+) -> dict[str, str]:
     """Resolve hobbyist resource_id(s) for enabled PV strings; updates plant.solcast in place."""
     solcast = plant.solcast
     coords = resolve_coordinates(hass, solcast)
@@ -171,7 +175,7 @@ async def async_resolve_rooftop_bindings(hass: HomeAssistant, plant: PlantConfig
             "(panel count > 0) to fetch forecasts."
         )
 
-    sites = await async_list_rooftop_sites(hass, solcast)
+    sites = await async_list_rooftop_sites(hass, solcast, trigger=trigger, manual=manual)
     if not sites:
         raise SolcastApiError(
             "No Home PV systems found on your Solcast account. "

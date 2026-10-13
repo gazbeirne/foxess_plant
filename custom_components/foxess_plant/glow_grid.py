@@ -70,9 +70,17 @@ def apply_glow_grid_overlay(
     out["grid_data_source"] = glow_live.get("source") or "glow"
 
     if analytics and glow_live.get("import_kwh_today") is not None:
+        from .analytics import load_from_pv_battery_kwh
+
         load_cons = float(analytics.get("load_consumption_kwh_today") or 0)
         from_grid = float(out.get("load_from_grid_kwh_today") or 0)
-        from_pv_battery = max(0.0, load_cons - from_grid)
+        from_pv_battery = load_from_pv_battery_kwh(
+            load=load_cons,
+            from_grid=from_grid,
+            pv=float(analytics.get("pv_production_kwh_today") or 0),
+            to_grid=float(out.get("pv_to_grid_kwh_today") or 0),
+            charge=float(analytics.get("battery_charge_kwh_today") or 0),
+        )
         out["load_from_pv_battery_kwh_today"] = round(from_pv_battery, 2)
         if load_cons > 0:
             out["self_sufficiency_percent_today"] = round(
