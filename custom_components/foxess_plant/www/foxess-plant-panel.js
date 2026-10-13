@@ -15182,6 +15182,25 @@ details.fox-report-details[open] > summary.fox-report-details-title {
   padding: 8px 10px; border-radius: 8px; border: 1px solid var(--divider-color);
   background: var(--card-background-color); color: var(--primary-text-color); font-size: 14px; font-family: inherit;
 }
+/* Neutralize WebKit native calendar/clock picker indicator.
+   In macOS WKWebView / Mac Catalyst (Home Assistant Companion App) and macOS Safari
+   inside Shadow DOM, invoking the native AppKit NSPopover causes an unhandled WebKit
+   process crash (SIGSEGV/SIGTRAP), terminating the macOS app or reloading the tab in Safari.
+   Hiding the indicator removes the crashing popover trigger while preserving keyboard/stepper
+   editing on desktop and native UIDatePicker on iOS. */
+input[type="time"]::-webkit-calendar-picker-indicator {
+  display: none !important;
+  -webkit-appearance: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+}
+input[type="time"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
 .field select {
   width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--divider-color);
   background: var(--card-background-color); color: var(--primary-text-color); font-size: 14px; font-family: inherit;
@@ -15996,6 +16015,7 @@ class FoxessPlantPanel extends HTMLElement {
     this._onPaste = this._onPaste.bind(this);
     this._onOctopusGreenerHoverMove = this._handleOctopusGreenerHoverMove.bind(this);
     this._onOctopusGreenerHoverEnd = this._handleOctopusGreenerHoverEnd.bind(this);
+    this._onKeyDown = this._handleKeyDown.bind(this);
     this._octopusGreenerHoverPlot = null;
   }
 
@@ -16027,6 +16047,7 @@ class FoxessPlantPanel extends HTMLElement {
     this._root.addEventListener("pointercancel", this._onPointerUp);
     this._root.addEventListener("focusin", this._onFocusIn, true);
     this._root.addEventListener("focusout", this._onFocusOut, true);
+    this._root.addEventListener("keydown", this._onKeyDown);
     this._root.addEventListener("paste", this._onPaste, true);
     this._root.addEventListener("mousemove", this._onOctopusGreenerHoverMove);
     this._root.addEventListener("mouseleave", this._onOctopusGreenerHoverEnd);
@@ -16063,6 +16084,7 @@ class FoxessPlantPanel extends HTMLElement {
     this._root.removeEventListener("pointercancel", this._onPointerUp);
     this._root.removeEventListener("focusin", this._onFocusIn, true);
     this._root.removeEventListener("focusout", this._onFocusOut, true);
+    this._root.removeEventListener("keydown", this._onKeyDown);
     this._root.removeEventListener("paste", this._onPaste, true);
     this._root.removeEventListener("mousemove", this._onOctopusGreenerHoverMove);
     this._root.removeEventListener("mouseleave", this._onOctopusGreenerHoverEnd);
@@ -16452,11 +16474,18 @@ Reloading panel registration…
     if (tag === "SELECT" || tag === "TEXTAREA") return true;
     if (tag !== "INPUT") return false;
     const type = (el.type || "text").toLowerCase();
-    return ["range", "date", "number", "text", "password"].includes(type);
+    return ["range", "date", "time", "number", "text", "password"].includes(type);
   }
 
   _onFocusIn(e) {
     if (!this._root.contains(e.target)) return;
+    if (e.target?.matches?.('input[type="time"]')) {
+      try {
+        if (typeof e.target.showPicker === "function") {
+          e.target.showPicker = () => {};
+        }
+      } catch (_) {}
+    }
     if (this._view === "settings" || this._isDeviceFormView()) {
       if (
         e.target.matches?.("input, select, textarea, ha-entity-picker") ||
@@ -16534,6 +16563,15 @@ Reloading panel registration…
     }
     if (parts[0] === "octopus" && parts[1] === "refresh_token" && this._octopusDraft) {
       this._octopusDraft.refresh_token = text.trim();
+    }
+  }
+
+  _handleKeyDown(ev) {
+    if (
+      ev.target?.matches?.('input[type="time"]') &&
+      (ev.key === " " || (ev.altKey && (ev.key === "ArrowDown" || ev.key === "Down")))
+    ) {
+      ev.preventDefault();
     }
   }
 
