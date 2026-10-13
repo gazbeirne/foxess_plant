@@ -127,7 +127,7 @@ PANEL_ENTITY_SUFFIXES: dict[str, tuple[str, ...]] = {
     "pv4_voltage": ("pv4_voltage", "pv4_volt", "pv4_volts"),
     "pv4_current": ("pv4_current",),
     "pv4_power": ("pv4_power",),
-    "pv_power": ("pv_power_evo_10", "pv_power_now", "pv_power", "pv_power_total", "pv1_power"),
+    "pv_power": ("pv_power_evo_10", "pv_power_now", "pv_power", "pv_power_total"),
     "solar_energy_today": ("solar_energy_today",),
     "solar_energy_total": ("solar_energy_total",),
     # AC / inverter

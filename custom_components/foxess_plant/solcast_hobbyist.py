@@ -33,7 +33,14 @@ def _azimuth_match(a: int, b: int, *, tolerance: int = 5) -> bool:
     aa = a % 360
     bb = b % 360
     diff = abs(aa - bb)
-    return diff <= tolerance or diff >= 360 - tolerance
+    if diff <= tolerance or diff >= 360 - tolerance:
+        return True
+    # Support Solcast / PV convention where South is 0° (-90°=East, 90°=West) vs compass where North is 0°
+    diff_s = abs(((180 + aa) % 360) - bb)
+    if diff_s <= tolerance or diff_s >= 360 - tolerance:
+        return True
+    diff_sb = abs(aa - ((180 + bb) % 360))
+    return diff_sb <= tolerance or diff_sb >= 360 - tolerance
 
 
 def parse_rooftop_site_list(payload: dict[str, Any] | None) -> list[dict[str, Any]]:

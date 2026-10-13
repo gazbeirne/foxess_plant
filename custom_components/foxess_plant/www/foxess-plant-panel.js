@@ -5935,6 +5935,98 @@ function repairDeviceNewSummaryElement(summary) {
   return summary;
 }
 
+function patchDeviceNewSummary(summaryEl, hass, plant, plantState) {
+  if (!summaryEl) return false;
+  const rep = repairDeviceNewSummaryElement(summaryEl);
+  if (!rep) return false;
+  const freshCardsHtml = renderDeviceNewSummaryCardItems(hass, plant, plantState);
+  const temp = document.createElement("div");
+  temp.innerHTML = freshCardsHtml;
+  const curCards = rep.querySelectorAll(".fox-device-new-summary-card");
+  const newCards = temp.querySelectorAll(".fox-device-new-summary-card");
+  if (curCards.length && curCards.length === newCards.length) {
+    for (let i = 0; i < curCards.length; i++) {
+      const curBody = curCards[i].querySelector(".fox-device-new-summary-body");
+      const newBody = newCards[i].querySelector(".fox-device-new-summary-body");
+      if (curBody && newBody && curBody.innerHTML !== newBody.innerHTML) {
+        curBody.innerHTML = newBody.innerHTML;
+      }
+    }
+    return true;
+  }
+  rep.innerHTML = freshCardsHtml;
+  return true;
+}
+
+function patchDeviceNewMetricItems(containerEl, freshHtml) {
+  if (!containerEl || !freshHtml) return false;
+  const temp = document.createElement("div");
+  temp.innerHTML = freshHtml;
+  const curItems = containerEl.querySelectorAll(".fox-device-new-metric-item");
+  const newItems = temp.querySelectorAll(".fox-device-new-metric-item");
+  if (curItems.length && curItems.length === newItems.length) {
+    for (let j = 0; j < curItems.length; j++) {
+      const curVal = curItems[j].querySelector(".fox-device-new-metric-value");
+      const newVal = newItems[j].querySelector(".fox-device-new-metric-value");
+      if (curVal && newVal && curVal.innerHTML !== newVal.innerHTML) {
+        curVal.innerHTML = newVal.innerHTML;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function patchDeviceNewRealtime(realtimeEl, freshRealtimeHtml, host) {
+  if (!realtimeEl || !freshRealtimeHtml) return false;
+  const temp = document.createElement("div");
+  temp.innerHTML = freshRealtimeHtml;
+  const freshContainer = temp.firstElementChild || temp;
+  if (!freshContainer || freshContainer.children.length !== realtimeEl.children.length) {
+    const savedScroll = host?.scrollTop;
+    realtimeEl.innerHTML = freshRealtimeHtml.replace(/^<div class="fox-device-new-realtime">|<\/div>$/g, "");
+    if (host && savedScroll != null && host.scrollTop !== savedScroll) {
+      host.scrollTop = savedScroll;
+    }
+    return true;
+  }
+  for (let i = 0; i < realtimeEl.children.length; i++) {
+    const curSec = realtimeEl.children[i];
+    const newSec = freshContainer.children[i];
+    // Check tables (e.g. PV, AC, EPS)
+    const curTable = curSec.querySelector(".device-param-table");
+    const newTable = newSec.querySelector(".device-param-table");
+    if (curTable && newTable) {
+      const curRows = curTable.querySelectorAll("tbody tr");
+      const newRows = newTable.querySelectorAll("tbody tr");
+      if (curRows.length === newRows.length) {
+        for (let r = 0; r < curRows.length; r++) {
+          const curCells = curRows[r].querySelectorAll("td");
+          const newCells = newRows[r].querySelectorAll("td");
+          for (let c = 0; c < curCells.length; c++) {
+            if (curCells[c] && newCells[c] && curCells[c].innerHTML !== newCells[c].innerHTML) {
+              curCells[c].innerHTML = newCells[c].innerHTML;
+            }
+          }
+        }
+      }
+    }
+    // Check metric grid items (Load, Datalogger, Grid, Battery subsections)
+    const curItems = curSec.querySelectorAll(".fox-device-new-metric-item");
+    const newItems = newSec.querySelectorAll(".fox-device-new-metric-item");
+    if (curItems.length === newItems.length) {
+      for (let j = 0; j < curItems.length; j++) {
+        const curVal = curItems[j].querySelector(".fox-device-new-metric-value");
+        const newVal = newItems[j].querySelector(".fox-device-new-metric-value");
+        if (curVal && newVal && curVal.innerHTML !== newVal.innerHTML) {
+          curVal.innerHTML = newVal.innerHTML;
+        }
+      }
+    }
+  }
+  return true;
+}
+
 function renderDeviceNewMetricGrid(hass, rows) {
   if (!rows.length) {
     return `<p class="device-param-empty">No sensors discovered for this section.</p>`;
@@ -6235,7 +6327,7 @@ function renderDeviceNewSidebar(hass, plant, plantState) {
     : `<p class="placeholder">No device identity available yet.</p>`;
   return `<div class="fox-device-new-sidebar-col"><aside class="fox-device-new-sidebar">
 <div class="fox-device-new-sidebar-hero">
-<img class="fox-device-new-sidebar-img" src="${esc(DEVICE_EVO_IMAGE_STATIC)}" alt="" loading="lazy" />
+<img class="fox-device-new-sidebar-img" src="${esc(DEVICE_EVO_IMAGE_STATIC)}" alt="" width="64" height="72" loading="lazy" />
 ${serialHero}
 </div>
 <div class="fox-device-new-sidebar-divider" aria-hidden="true"></div>
@@ -14580,7 +14672,10 @@ details.fox-report-details[open] > summary.fox-report-details-title {
 .fox-device-new-sidebar-col {
   grid-column: 1; align-self: start;
   min-width: 0; margin: 0; padding: 0;
-  position: sticky; top: 0; z-index: 1;
+  position: sticky; top: 100px; z-index: 1;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  scrollbar-width: thin;
 }
 .fox-device-new-sidebar-hero {
   display: flex; flex-direction: column; align-items: center; text-align: center;
@@ -14655,7 +14750,7 @@ details.fox-report-details[open] > summary.fox-report-details-title {
 .fox-device-new-sidebar-divider {
   height: 1px; background: var(--divider-color); margin: 0 0 12px;
 }
-.fox-device-new-sidebar-img { width: 64px; height: auto; max-height: 72px; object-fit: contain; object-position: top center; flex-shrink: 0; display: block; }
+.fox-device-new-sidebar-img { width: 64px; height: auto; max-height: 72px; aspect-ratio: 64 / 72; object-fit: contain; object-position: top center; flex-shrink: 0; display: block; }
 .fox-device-new-sidebar-serial-btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   padding: 4px 6px; margin: 0; border: none; background: transparent;
@@ -15055,7 +15150,7 @@ details.fox-report-details[open] > summary.fox-report-details-title {
   .fox-device-new-sidebar-col,
   .fox-device-new-content,
   .fox-device-new-analysis-stack { grid-column: 1; }
-  .fox-device-new-sidebar-col { position: static; }
+  .fox-device-new-sidebar-col { position: static; max-height: none; overflow: visible; }
   .fox-device-new-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fox-device-new-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fox-device-new-metric-item:nth-child(3n) { border-right: 1px solid var(--divider-color); }
@@ -15066,13 +15161,13 @@ details.fox-report-details[open] > summary.fox-report-details-title {
   .fox-device-new-sidebar-col,
   .fox-device-new-content,
   .fox-device-new-analysis-stack { grid-column: 1; }
-  .fox-device-new-sidebar-col { position: static; }
+  .fox-device-new-sidebar-col { position: static; max-height: none; overflow: visible; }
 }
 .shell.narrow .fox-device-new-layout { grid-template-columns: 1fr; row-gap: 14px; }
 .shell.narrow .fox-device-new-sidebar-col,
 .shell.narrow .fox-device-new-content,
 .shell.narrow .fox-device-new-analysis-stack { grid-column: 1; }
-.shell.narrow .fox-device-new-sidebar-col { position: static; }
+.shell.narrow .fox-device-new-sidebar-col { position: static; max-height: none; overflow: visible; }
 @media (max-width: 520px) {
   .fox-device-new-summary { grid-template-columns: 1fr; }
   .fox-device-new-metric-grid { grid-template-columns: 1fr; }
@@ -16337,9 +16432,9 @@ Reloading panel registration…
     const root = this._root?.querySelector?.("[data-device-new-main]");
     const plant = this._getPlant();
     if (root && plant && this._hass) {
-      const summary = repairDeviceNewSummaryElement(root.querySelector("[data-device-new-summary]"));
+      const summary = root.querySelector("[data-device-new-summary]");
       if (summary) {
-        summary.innerHTML = renderDeviceNewSummaryCardItems(this._hass, plant, this._plantState);
+        patchDeviceNewSummary(summary, this._hass, plant, this._plantState);
       }
     }
     return true;
@@ -16637,6 +16732,21 @@ Reloading panel registration…
     shell.classList.toggle("has-subnav", hasSubnav);
   }
 
+  _patchStaticFormOrReportViewLiveIfNeeded() {
+    if (this._view === "reports") return true;
+    if (this._view === "settings" && this._settingsView !== "glow") return true;
+    if (this._view === "device_new") {
+      const sub = this._deviceNewSub;
+      if (sub === "quick-settings") {
+        const wrap = this._root?.querySelector?.(".triple-soc-track");
+        if (wrap) this._bindTripleSoc();
+        return true;
+      }
+      return sub === "pv-config" || sub === "storm" || sub === "warmup";
+    }
+    return false;
+  }
+
   _scheduleRender(force = false) {
     if (
       !force &&
@@ -16650,7 +16760,8 @@ Reloading panel registration…
         this._patchSettingsMainLiveIfNeeded() ||
         this._patchGlowSettingsLiveIfNeeded() ||
         this._patchSettingsSmartChargeLiveIfNeeded() ||
-        this._patchEnergyAnalysisMainIfNeeded())
+        this._patchEnergyAnalysisMainIfNeeded() ||
+        this._patchStaticFormOrReportViewLiveIfNeeded())
     ) {
       this._renderPending = false;
       return;
@@ -16779,6 +16890,7 @@ Reloading panel registration…
   }
 
   _syncScheduleDraftFromDom() {
+    if (!this._scheduleDraft) this._initScheduleDraft();
     if (!this._scheduleDraft) return;
     const root = this._root;
     const enabledEl = root.querySelector('[data-field="schedule:enabled"]');
@@ -16797,7 +16909,10 @@ Reloading panel registration…
       const minSoc = root.querySelector(`[data-field="schedule:${idx}:min_soc"]`);
       if (minSoc?.value) seg.min_soc = parseInt(minSoc.value, 10);
       const minGrid = root.querySelector(`[data-field="schedule:${idx}:min_soc_on_grid"]`);
-      if (minGrid?.value) seg.min_soc_on_grid = parseInt(minGrid.value, 10);
+      if (minGrid?.value) {
+        seg.min_soc_on_grid = parseInt(minGrid.value, 10);
+        if (!minSoc) seg.min_soc = seg.min_soc_on_grid;
+      }
       const maxSoc = root.querySelector(`[data-field="schedule:${idx}:max_soc"]`);
       if (maxSoc?.value) seg.max_soc = parseInt(maxSoc.value, 10);
       const force = root.querySelector(`[data-field="schedule:${idx}:enable_force_charge"]`);
@@ -18762,6 +18877,7 @@ Reloading panel registration…
         this._loadDeviceNewCharts();
         if (this._deviceNewSub === "alarms") void this._loadDeviceNewAlarms({ force: true });
       }
+      this.scrollTop = 0;
       this._render();
       return;
     }
@@ -18781,6 +18897,7 @@ Reloading panel registration…
       if (sub === "storm") this._enterStormSettings();
       if (sub === "smart") this._enterSmartChargeSettings();
       if (sub === "warmup") void this._enterWarmupSettings();
+      this.scrollTop = 0;
       this._scheduleRender(true);
       return;
     }
@@ -18823,11 +18940,13 @@ Reloading panel registration…
       const sub = btn.dataset.sub;
       if (!sub) return;
       this._deviceNewScreen = sub;
+      this.scrollTop = 0;
       this._scheduleRender(true);
       return;
     }
     if (action === "device-new-back") {
       this._deviceNewScreen = "main";
+      this.scrollTop = 0;
       this._scheduleRender(true);
       return;
     }
@@ -19228,6 +19347,7 @@ Reloading panel registration…
       return;
     }
     if (action === "pick-work-mode") {
+      this._syncScheduleDraftFromDom();
       this._workModeDraft = btn.dataset.mode;
       this._render();
       return;
@@ -19411,6 +19531,10 @@ Reloading panel registration…
     }
     if (el?.dataset?.field) {
       const parts = el.dataset.field.split(":");
+      if (parts[0] === "schedule") {
+        this._syncScheduleDraftFromDom();
+        return;
+      }
       if (parts[0] === "solcast" && this._solcastDraft) {
         if (parts[1] === "enabled") {
           this._solcastDraft.enabled = el.checked;
@@ -19655,6 +19779,10 @@ Reloading panel registration…
     if (!el?.dataset?.field) return;
     const parts = el.dataset.field.split(":");
     const kind = parts[0];
+    if (kind === "schedule") {
+      this._syncScheduleDraftFromDom();
+      return;
+    }
     if (kind === "storm-behaviour" && this._stormDraft) {
       const field = parts[1];
       if (field !== "enable_force_charge" && field !== "enable_charge_from_grid") return;
@@ -20990,6 +21118,26 @@ ${octopusGreenerCard}${octopusRewardsCard}
 ${this._renderImpactPanel()}`;
   }
 
+  _overviewAfterHeroKey(plant) {
+    const flows = readEnergyFlows(this._hass, plant, this._plantState);
+    const soc = flows?.batterySoc;
+    const socChartKey = this._socChartPlantId || "";
+    const statChartKey = this._statisticsChartPlantId || "";
+    const greenerKey = this._octopusGreenerSlotKey ? this._octopusGreenerSlotKey() : "";
+    const forecastSlot = this._forecastAccuracyForOverview();
+    const forecastKey = `${forecastSlot?.loading ? 1 : 0}:${forecastSlot?.report?.forecast_total ?? ""}`;
+    return [
+      plant.entry_id,
+      statChartKey,
+      this._statisticsDayOffset || 0,
+      socChartKey,
+      Math.round(soc ?? 0),
+      greenerKey,
+      forecastKey,
+      this._plantState?.impact?.score ?? "",
+    ].join("|");
+  }
+
   _overviewHourlyWeatherSlotKey() {
     if (!this._overviewHourlyWeatherEnabled()) return "";
     if (this._hourlyWeatherLoading) return "loading";
@@ -21126,7 +21274,13 @@ ${this._renderImpactPanel()}`;
       this._overviewSummarySlotCache = breakdownKey;
     }
     this._patchOverviewHourlyWeatherSlot(mainEl);
-    mainEl.querySelector(".overview-after-hero").innerHTML = this._renderOverviewAfterHero(plant);
+    const afterHeroSlot = mainEl.querySelector(".overview-after-hero");
+    const afterHeroKey = this._overviewAfterHeroKey(plant);
+    if (afterHeroSlot && (!afterHeroSlot.hasChildNodes() || afterHeroKey !== this._overviewAfterHeroCache)) {
+      afterHeroSlot.innerHTML = this._renderOverviewAfterHero(plant);
+      this._overviewAfterHeroCache = afterHeroKey;
+      this._bindStatisticsChart();
+    }
 
     const sceneSlot = mainEl.querySelector(".overview-hero-scene-slot");
     if (rebuildFlow || !sceneSlot?.querySelector(".fox-flow-stage")) {
@@ -21869,8 +22023,9 @@ ${renderListButton({ action: "device-sub", sub: "pv-config" }, "System PV Config
       if (gen === this._deviceNewChartsGen) {
         this._deviceNewStatisticsChartLoading = false;
         if (this._view === "device_new" && this._getPlant()?.entry_id === plant.entry_id) {
-          this._patchDeviceNewAnalysisChartsIfNeeded();
-          this._scheduleRender(true);
+          if (!this._patchDeviceNewAnalysisChartsIfNeeded() && this._deviceNewAnalysisLayoutStale()) {
+            this._scheduleRender();
+          }
         }
       }
     }
@@ -21914,8 +22069,9 @@ ${renderListButton({ action: "device-sub", sub: "pv-config" }, "System PV Config
       if (gen === this._deviceNewChartsGen) {
         this._deviceNewEnergyChartLoading = false;
         if (this._view === "device_new" && this._getPlant()?.entry_id === plant.entry_id) {
-          this._patchDeviceNewAnalysisChartsIfNeeded();
-          this._scheduleRender(true);
+          if (!this._patchDeviceNewAnalysisChartsIfNeeded() && this._deviceNewAnalysisLayoutStale()) {
+            this._scheduleRender();
+          }
         }
       }
     }
@@ -22205,7 +22361,7 @@ ${this._renderInstallerSettings()}
         { label: "Δ meter − fox", html: `<span style="color:${deltaColor};font-weight:600">${esc(deltaTxt)}</span>` },
       ];
     };
-    return `<section class="fox-device-new-section">
+    return `<section class="fox-device-new-section fox-device-new-export-reconcile">
 <h3 class="fox-device-new-section-title">Export: inverter vs meter</h3>
 <p class="field-hint">What the FoxESS inverter believes it exported vs what your Glow smart meter actually recorded (meter − inverter).</p>
 <div class="fox-device-new-subsection"><h4 class="fox-device-new-subsection-title">Today</h4>${renderDeviceNewMetricGrid(this._hass, periodRows(foxToday, meterToday))}</div>
@@ -22215,17 +22371,34 @@ ${this._renderInstallerSettings()}
 
   _patchDeviceNewLiveIfNeeded() {
     if (this._view !== "device_new" || !this._hass) return false;
-    if (this._deviceNewSub === "analysis" || this._deviceNewSub === "pv-config" || this._deviceNewSub === "alarms" || this._deviceNewSub === "quick-settings" || isDeviceAutomationSub(this._deviceNewSub)) return false;
+    if (this._deviceNewSub === "pv-config" || this._deviceNewSub === "alarms" || this._deviceNewSub === "quick-settings" || isDeviceAutomationSub(this._deviceNewSub)) return false;
     if (this._deviceNewScreen !== "main") return false;
-    if (this._deviceNewAnalysisChartsStale()) return false;
+    if (this._deviceNewSub === "analysis" && this._deviceNewAnalysisLayoutStale()) return false;
     const root = this._root.querySelector("[data-device-new-main]");
     if (!root) return false;
     const plant = this._getPlant();
     if (!plant || root.dataset.plantId !== plant.entry_id) return false;
-    const summary = repairDeviceNewSummaryElement(root.querySelector("[data-device-new-summary]"));
-    if (!summary) return false;
-    summary.innerHTML = renderDeviceNewSummaryCardItems(this._hass, plant, this._plantState);
-    return true;
+    const summary = root.querySelector("[data-device-new-summary]");
+    if (summary) {
+      patchDeviceNewSummary(summary, this._hass, plant, this._plantState);
+    }
+    if (this._deviceNewSub === "analysis") {
+      this._patchDeviceNewAnalysisChartsIfNeeded();
+      return Boolean(summary);
+    }
+    const realtime = root.querySelector(".fox-device-new-realtime");
+    if (realtime) {
+      const freshRealtime = this._renderDeviceNewRealtimeSections(plant);
+      patchDeviceNewRealtime(realtime, freshRealtime, this);
+    }
+    const reconcileEl = root.querySelector(".fox-device-new-export-reconcile");
+    if (reconcileEl) {
+      const freshReconcile = this._renderExportReconciliation(plant);
+      if (freshReconcile) {
+        patchDeviceNewMetricItems(reconcileEl, freshReconcile);
+      }
+    }
+    return Boolean(summary || realtime);
   }
 
   _bindDeviceNewCharts() {
@@ -24330,11 +24503,12 @@ ${renderWorkModeIconHtml(opt)}<span class="mode-option-body"><span class="name">
 <div class="toggle-row"><span>Force charge</span><input type="checkbox" data-field="schedule:${idx}:enable_force_charge" ${seg.enable_force_charge ? "checked" : ""}></div>`
       : null;
     const periodMaxHint = `<p class="field-hint" style="margin:0 0 8px">Period max is written to the inverter&rsquo;s system max SOC while this segment runs.</p>`;
+    const normMode = (m) => String(m || "").trim().toLowerCase().replace(/[-_\s]+/g, " ");
     const modeOpts = options.length
       ? options
           .map(
             (opt) =>
-              `<option value="${esc(opt)}" ${opt === seg.work_mode ? "selected" : ""}>${esc(workModeMeta(opt).title)}</option>`
+              `<option value="${esc(opt)}" ${normMode(opt) === normMode(seg.work_mode) ? "selected" : ""}>${esc(workModeMeta(opt).title)}</option>`
           )
           .join("")
       : `<option value="${esc(seg.work_mode || "Self Use")}">${esc(seg.work_mode || "Self Use")}</option>`;
@@ -24363,6 +24537,7 @@ ${periodMaxHint}
   _renderQuickSettingsScheduleSection() {
     if (!this._scheduleDraft) this._initScheduleDraft();
     const draft = this._scheduleDraft;
+    const normMode = (m) => String(m || "").trim().toLowerCase().replace(/[-_\s]+/g, " ");
     const live = this._plantState?.plant_schedule ?? {};
     const active = live.active_segment;
     const activeHint = active
@@ -24374,7 +24549,7 @@ ${periodMaxHint}
     const remainingOpts = (remainingOptions.length ? remainingOptions : [draft.remaining_work_mode || "Self Use"])
       .map(
         (opt) =>
-          `<option value="${esc(opt)}" ${opt === draft.remaining_work_mode ? "selected" : ""}>${esc(workModeMeta(opt).title)}</option>`
+          `<option value="${esc(opt)}" ${normMode(opt) === normMode(draft.remaining_work_mode) ? "selected" : ""}>${esc(workModeMeta(opt).title)}</option>`
       )
       .join("");
     const segments = draft.segments || [];
@@ -24622,10 +24797,17 @@ ${body}
   _patchSettingsSmartChargeLiveIfNeeded() {
     if (!this._isSmartChargeView() || !this._hass) return false;
     const liveEl = this._root.querySelector("[data-smart-charge-live]");
-    if (!liveEl || !this._smartChargeDraft?.enabled) return false;
+    if (!liveEl) return false;
+    if (!this._smartChargeDraft?.enabled) return true;
     const { live, decision, dailyPlan, spreadPairs, planSummary } = this._smartChargeLivePlanContext();
+    const timelineScroll = liveEl.querySelector(".sc-timeline-scroll");
+    const savedScrollLeft = timelineScroll?.scrollLeft;
     liveEl.innerHTML = this._renderSmartChargeStatusCard(live, decision, dailyPlan, spreadPairs, planSummary);
     bindSmartChargeTimelineTips(liveEl);
+    if (savedScrollLeft != null && savedScrollLeft > 0) {
+      const newScroll = liveEl.querySelector(".sc-timeline-scroll");
+      if (newScroll) newScroll.scrollLeft = savedScrollLeft;
+    }
     return true;
   }
 
@@ -26007,15 +26189,10 @@ ${weatherOptions
         }
       }
     }
-    // Charts can draw shorter for a moment while they load, which clamps the scroll upwards: put it back, now and
-    // once laid out. Only ever downwards to where it was, so a scroll the user makes meanwhile isn't undone.
-    const unclamp = () => {
-      if (this._uiPageKey() === ui.page && ui.scroll && (this.scrollTop || 0) < ui.scroll - 1) {
-        this.scrollTop = ui.scroll;
-      }
-    };
-    unclamp();
-    requestAnimationFrame(unclamp);
+    // Restore scroll position across redraw of the same page
+    if (this._uiPageKey() === ui.page && ui.scroll != null) {
+      this.scrollTop = ui.scroll;
+    }
   }
 
   _renderPanel() {
