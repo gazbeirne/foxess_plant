@@ -62,6 +62,8 @@ WS_TYPE_TARIFF_ENTITY_CANDIDATES = "foxess_plant/tariff_entity_candidates"
 WS_TYPE_UPDATE_SOLCAST = "foxess_plant/update_solcast"
 WS_TYPE_TEST_SOLCAST = "foxess_plant/test_solcast"
 WS_TYPE_UPDATE_OPEN_METEO = "foxess_plant/update_open_meteo"
+WS_TYPE_UPDATE_EXPORT_SUPPLIER = "foxess_plant/update_export_supplier"
+WS_TYPE_TEST_EXPORT_SUPPLIER = "foxess_plant/test_export_supplier"
 WS_TYPE_OPEN_METEO_POINTS = "foxess_plant/open_meteo_points"
 WS_TYPE_UPDATE_GLOW = "foxess_plant/update_glow"
 WS_TYPE_TEST_GLOW = "foxess_plant/test_glow"
@@ -240,6 +242,21 @@ TARIFF_SCHEMA = vol.Schema(
         vol.Optional("schedule", default={}): TARIFF_SCHEDULE_SCHEMA,
         vol.Optional("apply_band_inverter_control", default=False): cv.boolean,
         vol.Optional("dynamic", default={}): TARIFF_DYNAMIC_SCHEMA,
+        vol.Optional("export_provider"): vol.In(["same", "manual", "entity", "octopus", "eon_next"]),
+    }
+)
+
+# Export priced apart from import (tariff_export.py): the choice, and a different supplier's login
+EXPORT_SUPPLIER_SCHEMA = vol.Schema(
+    {
+        vol.Required("provider"): vol.In(["same", "manual", "entity", "octopus", "eon_next"]),
+        vol.Optional("export_entity"): vol.Any(str, None),
+        vol.Optional("api_key"): vol.Any(str, None),
+        vol.Optional("account_number"): vol.Any(str, None),
+        vol.Optional("export_mpan"): vol.Any(str, None),
+        vol.Optional("email"): vol.Any(str, None),
+        vol.Optional("password"): vol.Any(str, None),
+        vol.Optional("refresh_token"): vol.Any(str, None),
     }
 )
 
@@ -1281,6 +1298,56 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
 
     @websocket_api.websocket_command(
         {
+            vol.Required("type"): WS_TYPE_UPDATE_EXPORT_SUPPLIER,
+            vol.Optional("plant_id"): str,
+            vol.Required("export"): EXPORT_SUPPLIER_SCHEMA,
+        }
+    )
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_update_export_supplier(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict[str, Any],
+    ) -> None:
+        coordinator, err_code, err_msg = _get_coordinator(hass, msg.get("plant_id"))
+        if coordinator is None:
+            connection.send_error(msg["id"], err_code, err_msg)
+            return
+        try:
+            await coordinator.async_save_export_supplier(export=dict(msg["export"]))
+        except HomeAssistantError as err:
+            connection.send_error(msg["id"], "export_supplier_failed", str(err))
+            return
+        connection.send_result(msg["id"], coordinator.get_plant_state())
+
+    @websocket_api.websocket_command(
+        {
+            vol.Required("type"): WS_TYPE_TEST_EXPORT_SUPPLIER,
+            vol.Optional("plant_id"): str,
+            vol.Required("export"): EXPORT_SUPPLIER_SCHEMA,
+        }
+    )
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_test_export_supplier(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict[str, Any],
+    ) -> None:
+        coordinator, err_code, err_msg = _get_coordinator(hass, msg.get("plant_id"))
+        if coordinator is None:
+            connection.send_error(msg["id"], err_code, err_msg)
+            return
+        try:
+            result = await coordinator.async_test_export_supplier(export=dict(msg["export"]))
+        except HomeAssistantError as err:
+            connection.send_error(msg["id"], "export_supplier_test_failed", str(err))
+            return
+        connection.send_result(msg["id"], result)
+
+    @websocket_api.websocket_command(
+        {
             vol.Required("type"): WS_TYPE_TEST_SOLCAST,
             vol.Optional("plant_id"): str,
         }
@@ -1764,6 +1831,8 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_update_solcast)
     websocket_api.async_register_command(hass, ws_test_solcast)
     websocket_api.async_register_command(hass, ws_update_open_meteo)
+    websocket_api.async_register_command(hass, ws_update_export_supplier)
+    websocket_api.async_register_command(hass, ws_test_export_supplier)
     websocket_api.async_register_command(hass, ws_open_meteo_points)
     websocket_api.async_register_command(hass, ws_update_glow)
     websocket_api.async_register_command(hass, ws_test_glow)

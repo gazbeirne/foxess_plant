@@ -51,9 +51,28 @@ def _entity_power_kw(coordinator: Any, key: str) -> float | None:
 
 
 def _octopus_rates_p_per_kwh(coordinator: Any) -> tuple[float | None, float | None]:
+    """Current import / export p/kWh: the supplier cache, else the rate rows SmartCharge plans with.
+
+    The cache only exists with an import supplier; export from a sensor or another supplier, and band rates,
+    come from the planner's rows (tariff_export.py).
+    """
     cache = coordinator._octopus_cache or {}
     imp = cache.get("current_import_p_per_kwh")
     exp = cache.get("current_export_p_per_kwh")
+    if (imp is None or exp is None) and hasattr(coordinator, "_smart_charge_rate_rows"):
+        from homeassistant.util import dt as dt_util
+
+        from ..octopus_tariff import rate_at
+
+        try:
+            import_rows, export_rows = coordinator._smart_charge_rate_rows()
+        except Exception:  # noqa: BLE001 — no rates is the old behaviour
+            import_rows, export_rows = [], []
+        now = dt_util.utcnow()
+        if imp is None and import_rows:
+            imp = rate_at(now, import_rows)
+        if exp is None and export_rows:
+            exp = rate_at(now, export_rows)
     return (
         float(imp) if imp is not None else None,
         float(exp) if exp is not None else None,
