@@ -765,6 +765,8 @@ class SolcastConfig:
     api_used_today: int = 0
     api_used_date: str | None = None
     last_fetch_at: str | None = None
+    # Last request sent to Solcast, successful or not; spaces retries after a failure
+    last_attempt_at: str | None = None
     last_error: str | None = None
     rooftop_site_bindings: dict[str, str] = field(default_factory=dict)
     rooftop_sites_meta: list[dict[str, Any]] = field(default_factory=list)
@@ -811,6 +813,7 @@ class SolcastConfig:
             api_used_today=int(data.get("api_used_today", 0) or 0),
             api_used_date=data.get("api_used_date"),
             last_fetch_at=data.get("last_fetch_at"),
+            last_attempt_at=data.get("last_attempt_at"),
             last_error=data.get("last_error"),
             rooftop_site_bindings=bindings,
             rooftop_sites_meta=sites_meta,
@@ -829,6 +832,7 @@ class SolcastConfig:
             "api_used_today": self.api_used_today,
             "api_used_date": self.api_used_date,
             "last_fetch_at": self.last_fetch_at,
+            "last_attempt_at": self.last_attempt_at,
             "last_error": self.last_error,
             "rooftop_site_bindings": dict(self.rooftop_site_bindings),
             "rooftop_sites_meta": list(self.rooftop_sites_meta),

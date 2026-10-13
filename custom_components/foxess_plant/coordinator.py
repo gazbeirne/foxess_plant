@@ -131,6 +131,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._alert_log: Any = None
         self._alert_active: dict[str, set[str]] = {}
         self._unsub_alert_log: Any = None
+        # Whether the "solar forecast out of date" notification is showing (see _check_solcast_forecast_stale)
+        self._solcast_stale_notified = False
         self._hems_audit_sigs: dict[str, str] = {}
         self._smart_charge_plan_meta: dict[str, Any] = {}
         self._smart_charge_target_max_soc: float | None = None
@@ -1859,6 +1861,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_refresh_solcast_pv(self, *, force: bool = False) -> None:
         """Poll Solcast rooftop PV forecast (Google Weather handles storms/overview)."""
         if not self._solcast_pv_active():
+            self._check_solcast_forecast_stale()  # dismisses the notification once Solcast is turned off
             return
         from .solcast_poll import async_refresh_solcast
 
@@ -1911,7 +1914,42 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception:
                     _LOGGER.exception("Solcast forecast chart rebuild failed after poll")
             self._persist_solcast_usage()
+        self._check_solcast_forecast_stale()
         await self.async_request_refresh()
+
+    def _check_solcast_forecast_stale(self) -> None:
+        """Notify (once, until it recovers) when the Solcast forecast no longer reaches tomorrow afternoon."""
+        from homeassistant.components import persistent_notification
+        from homeassistant.util import dt as dt_util
+
+        from .smart_charge.planner import forecast_end
+        from .solcast_poll import forecast_is_stale
+
+        notification_id = f"foxess_plant_solcast_stale_{self.config_entry.entry_id}"
+        sc = self.plant.solcast
+        end = forecast_end(self._solcast_detailed_forecast_rows())
+        stale = self._solcast_pv_active() and forecast_is_stale(
+            end, dt_util.utcnow(), ever_fetched=bool(sc.last_fetch_at)
+        )
+        if stale == self._solcast_stale_notified:
+            return
+        self._solcast_stale_notified = stale
+        if not stale:
+            persistent_notification.async_dismiss(self.hass, notification_id)
+            _LOGGER.info("Solcast PV forecast is current again")
+            return
+        last = dt_util.parse_datetime(sc.last_fetch_at) if sc.last_fetch_at else None
+        last_text = dt_util.as_local(last).strftime("%d %b %H:%M") if last else "never"
+        message = (
+            f"No new Solcast PV forecast since {last_text}"
+            + (f" (last error: {sc.last_error})" if sc.last_error else "")
+            + ". SmartCharge is estimating tomorrow's solar from a previous day, so tonight's grid "
+            "charge may be too big or too small. Check your Solcast API usage at toolkit.solcast.com.au."
+        )
+        _LOGGER.warning("Solcast PV forecast is out of date: %s", message)
+        persistent_notification.async_create(
+            self.hass, message, title="FoxESS Plant: solar forecast out of date", notification_id=notification_id
+        )
 
     async def _async_refresh_storm_weather(self) -> None:
         """Re-evaluate StormSafe using Google Weather (hourly forecast + condition sensors)."""
@@ -5538,7 +5576,12 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             try:
                 await async_resolve_rooftop_bindings(self.hass, self.plant)
             except SolcastApiError as err:
-                raise HomeAssistantError(str(err)) from err
+                # Solcast busy / limiting: the settings are saved; keep the sites already matched
+                if err.status != 429 or not self.plant.solcast.rooftop_site_bindings:
+                    raise HomeAssistantError(str(err)) from err
+                _LOGGER.warning("Solcast settings saved, but Solcast refused the site check: %s", err)
+                self.plant.solcast.last_error = f"Settings saved; site check refused by Solcast ({err})"
+                fetch_now = False
             data = dict(self.config_entry.data)
             data[CONF_SOLCAST] = self.plant.solcast.to_dict()
             self.hass.config_entries.async_update_entry(self.config_entry, data=data)

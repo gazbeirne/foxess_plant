@@ -537,6 +537,7 @@ DEFAULT_SOLCAST = {
     "api_used_today": 0,
     "api_used_date": None,
     "last_fetch_at": None,
+    "last_attempt_at": None,
     "last_error": None,
     "rooftop_site_bindings": {},
     "rooftop_sites_meta": [],
