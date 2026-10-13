@@ -116,6 +116,17 @@ async def test_no_response_still_spaces_retries_but_is_not_counted(hass, monkeyp
     assert plant.solcast.api_used_today == 0
 
 
+def test_error_text_shows_reason_and_rate_limit_headers_when_the_body_is_empty() -> None:
+    from custom_components.foxess_plant.solcast_api import describe_error
+
+    text = describe_error(429, "Too Many Requests", "", {"Retry-After": "3600", "X-RateLimit-Remaining": "0",
+                                                         "Content-Type": "text/plain"})
+    assert text == ("Solcast HTTP 429 Too Many Requests · no message in the response · Retry-After: 3600"
+                    " · X-Ratelimit-Remaining: 0")
+    body = '{"response_status": {"error_code": "TooManyRequests", "message": "You have exceeded your free daily limit."}}'
+    assert "TooManyRequests You have exceeded" in describe_error(429, "Too Many Requests", body, {})
+
+
 def test_forecast_is_stale_only_when_tomorrow_afternoon_is_missing() -> None:
     tz = dt_util.get_default_time_zone()
     day = datetime(2026, 10, 12, tzinfo=tz)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 from urllib.parse import urlencode
@@ -38,6 +39,34 @@ DEFAULT_FORECAST_OUTPUT = (
     "cape",
     "weather_type",
 )
+
+
+_INFO_HEADERS = ("retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset")
+
+
+def describe_error(status: int, reason: str | None, body: str, headers: dict[str, str]) -> str:
+    """Readable error: status, Solcast's own message when it sends one, and the rate-limit headers.
+
+    Solcast's 429s often come with an empty body, so the headers (Retry-After, X-RateLimit-*) are what
+    tells "daily limit used up" from "service busy".
+    """
+    text = (body or "").strip()
+    message = ""
+    if text:
+        try:
+            data = json.loads(text)
+            status_block = data.get("response_status") if isinstance(data, dict) else None
+            if isinstance(status_block, dict):
+                message = " ".join(
+                    str(status_block[k]) for k in ("error_code", "message") if status_block.get(k)
+                )
+        except ValueError:
+            pass
+        message = message or text[:240]
+    parts = [f"Solcast HTTP {status}{f' {reason}' if reason else ''}", message or "no message in the response"]
+    lower = {k.lower(): v for k, v in headers.items()}
+    parts += [f"{name.title()}: {lower[name]}" for name in _INFO_HEADERS if lower.get(name)]
+    return " · ".join(parts)
 
 
 class SolcastApiError(Exception):
@@ -93,7 +122,17 @@ class SolcastApiClient:
                     retry = dict(query)
                     retry["output_parameters"] = ",".join(fallback_output)
                     return await self._request(path, retry, fallback_output=None)
-                raise SolcastApiError(f"Solcast HTTP {resp.status}: {body[:240]}", status=resp.status)
+                _LOGGER.warning(
+                    "Solcast %s returned HTTP %s %s; headers %s; body %r",
+                    path,
+                    resp.status,
+                    resp.reason,
+                    {k: v for k, v in resp.headers.items() if k.lower() not in ("set-cookie", "authorization")},
+                    body[:500],
+                )
+                raise SolcastApiError(
+                    describe_error(resp.status, resp.reason, body, dict(resp.headers)), status=resp.status
+                )
         except aiohttp.ClientError as err:
             raise SolcastApiError(str(err)) from err
 
