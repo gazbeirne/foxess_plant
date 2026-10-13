@@ -438,7 +438,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.511";
+const PANEL_VERSION = "0.9.512";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -25415,10 +25415,6 @@ ${pluginHint}
     const bandLabel =
       scheduleStatus.band_index != null ? TARIFF_BAND_LABELS[scheduleStatus.band_index] || "" : "";
     return `<header class="header"><h1>Tariff</h1><p>Electricity rates for cost and revenue analysis. Import and export can each come from a supplier, a Home Assistant sensor, or rates you type in — the same supplier for both, or different ones.</p></header>
-${this._renderTariffImportCard(entities, currency)}
-${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
-${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
-${this._renderTariffExportCard(entities, currency)}
 <div class="card">
 <p class="card-title">Electricity Tariff</p>
 <div class="field">
@@ -25436,6 +25432,10 @@ ${this._renderTariffRateBlock("standing", {
     })}
 <div class="btn-row"><button type="button" class="btn btn-primary" data-action="save-tariff-settings" ${this._busy ? "disabled" : ""}>Save Tariff</button></div>
 </div>
+${this._renderTariffImportCard(entities, currency)}
+${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
+${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
+${this._renderTariffExportCard(entities, currency)}
 <div class="card">
 <p class="card-title">Status</p>
 <p style="margin:0 0 8px;font-size:14px">${live.configured ? "Tariff configured — ready for cost analysis." : "Not configured yet — save at least one rate above."}</p>
@@ -25472,7 +25472,7 @@ ${effectiveBits.length ? `<p class="field-hint" style="margin:0 0 8px">Effective
     ).join("");
     const hint =
       provider === "manual"
-        ? "Type import rates per band in the Daily Time-of-Use Schedule below."
+        ? "Type import rates per band in the Daily Time-of-Use Schedule above."
         : provider === "entity"
           ? "A sensor that reports your import price — or an Octopus Energy integration rate sensor, whose upcoming rates SmartCharge also plans with."
           : `Connect your ${energyProviderLabel(provider)} account below: import rates and hour bands sync automatically.`;
@@ -25507,7 +25507,7 @@ ${provider === "entity" ? this._renderTariffEntityField("import", entities.impor
       provider === "same"
         ? `Export rates come from the export meter on your ${energyProviderLabel(importProvider)} account.`
         : provider === "manual"
-          ? "Type export rates per band in the Daily Time-of-Use Schedule below — e.g. a fixed SEG rate."
+          ? "Type export rates per band in the Daily Time-of-Use Schedule above — e.g. a fixed SEG rate."
           : provider === "entity"
             ? "A sensor that reports your export price (its upcoming rates too, if it lists them)."
             : `Export from a different supplier than import: sign in to ${energyProviderLabel(provider)} here. Only its export meter is used.`;
