@@ -957,6 +957,27 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
             _LOGGER.exception("fetch_performance_day failed")
             connection.send_error(msg["id"], "fetch_performance_day_failed", str(err))
             return
+        # PV Forecast line from the forecasts (Solcast while fresh, else Open-Meteo), not the 5-minute samples
+        from .performance_chart import build_pv_forecast_series
+
+        try:
+            day = target_day or dt_util.as_local(dt_util.now()).date()
+            job = partial(
+                build_pv_forecast_series,
+                hass,
+                target_day=day,
+                stored=await coordinator.async_read_solcast_stored(),
+                current_cache=coordinator._solcast_cache,
+                memory_snapshots=list(coordinator._solcast_memory_snapshots),
+                open_meteo_points=coordinator.open_meteo_points_for_day(day),
+                entry_id=coordinator.config_entry.entry_id,
+                solcast_enabled=coordinator.plant.solcast.enabled,
+            )
+            points, sources = await get_instance(hass).async_add_executor_job(job)
+            chart["series"]["solcast_forecast_kw"] = points
+            chart["pv_forecast_sources"] = sources
+        except Exception:  # noqa: BLE001 — keep the sampled line rather than failing the chart
+            _LOGGER.exception("PV forecast line failed for %s", target_day)
         connection.send_result(
             msg["id"],
             {"performance_day": chart, "plant_state": coordinator.get_plant_state()},

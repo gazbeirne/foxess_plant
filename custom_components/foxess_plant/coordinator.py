@@ -197,6 +197,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._performance_day: str = ""
         self._performance_daily: dict[str, Any] = {}
         self._unsub_performance: callable | None = None
+        # Panel temperature with thermal lag (performance/panel_thermal.py), stepped every 30 s, saved per tick
+        from .performance.panel_thermal import PanelThermal
+
+        self._panel_thermal = PanelThermal()
+        self._unsub_panel_thermal: callable | None = None
         self._battery_warmup_live: dict[str, Any] = {}
         # A warm-up save Fox Cloud hasn't confirmed yet ({"saved": settings, "since": UTC}), a re-check timer, and
         # the message when it never did
@@ -2030,8 +2035,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         last = dt_util.parse_datetime(raw) if raw else None
         return last is None or dt_util.utcnow() - last >= every
 
-    async def _async_refresh_open_meteo(self, *, force: bool = False) -> None:
-        """Fetch the forecast hourly and re-score the models twice a day (both only when enabled)."""
+    async def _async_refresh_open_meteo(self, *, force: bool = False, rescore: bool = False) -> None:
+        """Fetch the forecast hourly and re-score the models twice a day (both only when enabled).
+
+        ``force`` refetches the forecast now; ``rescore`` re-scores now (only needed when the models change).
+        """
         from homeassistant.helpers.aiohttp_client import async_get_clientsession
         from homeassistant.util import dt as dt_util
 
@@ -2063,7 +2071,12 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         forecast=forecast, fetched_at=dt_util.utcnow().isoformat(), last_error=None
                     )
                     changed = True
-            if force or self._open_meteo_due("scored_at", om.SCORE_REFRESH):
+            # A failed scoring run waits an hour too (it used to retry on every 10-minute tick)
+            if rescore or (
+                self._open_meteo_due("scored_at", om.SCORE_REFRESH)
+                and self._open_meteo_due("score_attempt_at", om.FORECAST_REFRESH)
+            ):
+                self._open_meteo_cache["score_attempt_at"] = dt_util.utcnow().isoformat()
                 tz = local_tz()
                 today = dt_util.now().date()
                 start = today - timedelta(days=om.SCORE_DAYS)
@@ -2240,19 +2253,20 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 kw = float(sc["pv_power_now_kw"])
             today = sc.get("forecast_today_kwh")
             return kw, float(today) if today is not None else None
+        from .open_meteo import chart_points
+        from .pv_forecast_line import interpolate_now
+
         now = dt_util.utcnow()
         today_local = dt_util.now().date()
-        kw_now = None
+        rows = self._open_meteo_rows()
         today_kwh = 0.0
-        for row in self._open_meteo_rows():
+        for row in rows:
             end = _row_end(row)
-            if end is None:
-                continue
-            if end - HALF_HOUR <= now < end:
-                kw_now = float(row["pv_estimate"])
-            if dt_util.as_local(end - HALF_HOUR).date() == today_local:
+            if end is not None and dt_util.as_local(end - HALF_HOUR).date() == today_local:
                 today_kwh += float(row["pv_estimate"]) * 0.5
-        return kw_now, round(today_kwh, 2)
+        # Between the hourly mid-points, not the hour's flat value (that stepped the clipping and panel temperature)
+        kw_now = interpolate_now(chart_points(rows), now.timestamp() * 1000)
+        return (round(kw_now, 3) if kw_now is not None else None), round(today_kwh, 2)
 
     def _solcast_fresh(self) -> bool:
         from homeassistant.util import dt as dt_util
@@ -2322,13 +2336,18 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_save_open_meteo(self, *, open_meteo: dict[str, Any]) -> None:
         from .models import OpenMeteoConfig
 
+        before = set(self.plant.open_meteo.models)
         merged = {**self.plant.open_meteo.to_dict(), **open_meteo}
         data = dict(self.config_entry.data)
         data["open_meteo"] = OpenMeteoConfig.from_dict(merged).to_dict()
         self.hass.config_entries.async_update_entry(self.config_entry, data=data)
         self.update_plant_config(PlantConfig.from_entry_data(data))
         if self.plant.open_meteo.enabled:
-            await self._async_refresh_open_meteo(force=True)
+            # Scoring pulls 30 days for every model: only redo it now when the models changed
+            unscored = set(self.plant.open_meteo.models) - set(self._open_meteo_cache.get("scores") or {})
+            await self._async_refresh_open_meteo(
+                force=True, rescore=set(self.plant.open_meteo.models) != before and bool(unscored)
+            )
         await self.async_request_refresh()
 
     async def _async_refresh_storm_weather(self) -> None:
@@ -3817,9 +3836,14 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Performance store init failed: %s", err)
 
     def _setup_performance_timer(self) -> None:
+        from .performance.panel_thermal import STEP_INTERVAL
+
         if self._unsub_performance:
             self._unsub_performance()
             self._unsub_performance = None
+        if self._unsub_panel_thermal:
+            self._unsub_panel_thermal()
+            self._unsub_panel_thermal = None
         if not self.plant.performance.enabled:
             return
         self._unsub_performance = async_track_time_interval(
@@ -3827,10 +3851,22 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._performance_timer_callback,
             timedelta(minutes=5),
         )
+        self._unsub_panel_thermal = async_track_time_interval(
+            self.hass, self._panel_thermal_callback, STEP_INTERVAL
+        )
 
     @callback
     def _performance_timer_callback(self, _now) -> None:
         self.hass.async_create_task(self._async_performance_tick())
+
+    @callback
+    def _panel_thermal_callback(self, _now) -> None:
+        from .performance.sample import step_panel_thermal
+
+        try:
+            step_panel_thermal(self)
+        except Exception as err:  # noqa: BLE001 — a missed step only means a coarser lag
+            _LOGGER.debug("Panel temperature step failed: %s", err)
 
     async def _async_performance_tick(self) -> None:
         from .performance.tick import async_performance_tick
@@ -6109,6 +6145,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if getattr(self, "_unsub_open_meteo", None):
             self._unsub_open_meteo()
             self._unsub_open_meteo = None
+        if getattr(self, "_unsub_panel_thermal", None):
+            self._unsub_panel_thermal()
+            self._unsub_panel_thermal = None
         if self._unsub_triggers:
             self._unsub_triggers()
             self._unsub_triggers = None

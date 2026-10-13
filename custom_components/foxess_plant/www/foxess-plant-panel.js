@@ -400,7 +400,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.509";
+const PANEL_VERSION = "0.9.510";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -3616,7 +3616,10 @@ function performanceChartAxesSvg({ padL, padT, w, h, xDomain, xScale, yScale, yT
       return `<text x="${padL - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end" class="statistics-axis-y">${esc(label)}${yUnit ? esc(yUnit) : ""}</text>`;
     })
     .join("");
-  const xTicks = forecastAccuracyXTicks(xDomain.tMin, xDomain.tMax, { maxTicks: 6 });
+  // A "07:00 AM" label needs ~70 px: on a phone six of them ran into each other
+  const xTicks = forecastAccuracyXTicks(xDomain.tMin, xDomain.tMax, {
+    maxTicks: Math.max(3, Math.min(6, Math.floor(w / 80))),
+  });
   const xLabels = xTicks
     .map((xt) => {
       const x = xScale(xt);
@@ -3830,8 +3833,13 @@ function renderPerformancePowerChartSvg(chart) {
   }
   const clipHatch = performanceClippingHatchSvg(pv, clip, xDomain, xScale, yScaleP);
   const hasClipping = performanceClipPoints(clip, xDomain.tMin, xDomain.tMax).some((p) => p.v > 0);
+  // The forecast SmartCharge was using: Solcast while fresh, else Open-Meteo (coral, as on the other charts)
+  const forecastSources = Array.isArray(chart?.pv_forecast_sources) ? chart.pv_forecast_sources : [];
+  const forecastColor =
+    forecastSources.length === 1 && forecastSources[0] === "Open-Meteo" ? OPEN_METEO_CHART_STYLE.color : "#f5c542";
+  const forecastLabel = forecastSources.length ? `PV Forecast (${forecastSources.join(", ")})` : "PV Forecast";
   const lines = [
-    { pts: potential, color: "#f5c542", width: 1.4, dash: "4 3" },
+    { pts: potential, color: forecastColor, width: 1.4, dash: "4 3" },
     { pts: pv, color: "#19D4DE", width: 2 },
     { pts: grid, color: "#2F6BFF", width: 1.8 },
     ...(hasClipping ? [{ pts: clip, color: "#ef4444", width: 1.4 }] : []),
@@ -3841,7 +3849,7 @@ function renderPerformancePowerChartSvg(chart) {
   const limitText = hasLimit ? ` (${acLimit.toFixed(1)} kW${limitOnScale ? "" : ", above this scale"})` : "";
   const legend = `<div class="fox-perf-chart-legend">
 <span><i style="background:#19D4DE"></i> Solar output kW</span>
-${potential.length ? `<span><i style="background:#f5c542"></i> PV Forecast</span>` : ""}
+${potential.length ? `<span><i style="background:${forecastColor}"></i> ${esc(forecastLabel)}</span>` : ""}
 <span><i style="background:#2F6BFF"></i> Net grid kW</span>
 ${hasLimit ? `<span><i style="background:#f59e0b"></i> Inverter AC limit${esc(limitText)}</span>` : ""}
 ${hasClipping ? `<span><i style="background:#ef4444"></i> Clipping kW</span>` : ""}
@@ -3870,7 +3878,7 @@ ${lines}
     tMax: xDomain.tMax,
     series: [
       { label: "Solar output", color: "#19D4DE", unit: " kW", points: pv },
-      ...(potential.length ? [{ label: "PV Forecast", color: "#f5c542", unit: " kW", points: potential }] : []),
+      ...(potential.length ? [{ label: "PV Forecast", color: forecastColor, unit: " kW", points: potential }] : []),
       { label: "Net grid", color: "#2F6BFF", unit: " kW", points: grid },
       ...(hasClipping ? [{ label: "Clipping", color: "#ef4444", unit: " kW", points: clip }] : []),
     ],
@@ -11352,7 +11360,9 @@ function renderStatisticsChartHtml(series, range, options = {}) {
   const xLabels = xTicks
     .map((xt) => {
       const x = xScale(xt);
-      const anchor = narrow && xt === tMin ? "start" : "middle";
+      // Centred like the rest: a left-anchored first label ran into the second on phones ("12:00 AM06:00 AM").
+      // There's room: the 40 px left pad holds half a label.
+      const anchor = "middle";
       return `<text x="${x.toFixed(1)}" y="${height - pad.b + 20}" text-anchor="${anchor}" class="statistics-axis-x">${esc(formatChartTimeLabel(xt))}</text>`;
     })
     .join("");
