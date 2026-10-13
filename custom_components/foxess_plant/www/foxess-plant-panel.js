@@ -16944,6 +16944,9 @@ Reloading panel registration…
         if (wrap) this._bindTripleSoc();
         return true;
       }
+      if (sub === "smart") {
+        return this._patchSettingsSmartChargeLiveIfNeeded();
+      }
       return sub === "pv-config" || sub === "storm" || sub === "warmup";
     }
     return false;
@@ -19824,7 +19827,9 @@ Reloading panel registration…
       if (parts[0] === "smart-charge" && this._smartChargeDraft) {
         if (parts[1] === "enabled") {
           this._smartChargeDraft.enabled = el.checked;
-          this._scheduleRender();
+          if (el.checked) this._initSmartChargeSocDraft();
+          else this._smartChargeSocDraft = null;
+          this._scheduleRender(true);
           return;
         }
       }
@@ -20154,7 +20159,7 @@ Reloading panel registration…
         this._smartChargeDraft.enabled = el.checked;
         if (el.checked) this._initSmartChargeSocDraft();
         else this._smartChargeSocDraft = null;
-        this._scheduleRender();
+        this._scheduleRender(true);
         return;
       }
       if (field === "target_soc") {
@@ -20184,7 +20189,7 @@ Reloading panel registration…
       }
       if (field === "operating_mode") {
         this._smartChargeDraft.operating_mode = el.value || "max_safety";
-        this._scheduleRender();
+        this._scheduleRender(true);
         return;
       }
       if (field === "max_target_soc") {
@@ -25098,18 +25103,72 @@ ${body}
 
   _patchSettingsSmartChargeLiveIfNeeded() {
     if (!this._isSmartChargeView() || !this._hass) return false;
-    const liveEl = this._root.querySelector("[data-smart-charge-live]");
-    if (!liveEl) return false;
+    const settingsEl = this._root.querySelector("[data-smart-charge-settings]");
+    if (!settingsEl) return false;
+    if (!this._smartChargeDraft) this._initSmartChargeDraft();
+
+    // If SmartCharge is not enabled, this is a static settings form. Prevent full DOM rebuild.
     if (!this._smartChargeDraft?.enabled) return true;
-    const { live, decision, dailyPlan, spreadPairs, planSummary } = this._smartChargeLivePlanContext();
-    const timelineScroll = liveEl.querySelector(".sc-timeline-scroll");
-    const savedScrollLeft = timelineScroll?.scrollLeft;
-    liveEl.innerHTML = this._renderSmartChargeStatusCard(live, decision, dailyPlan, spreadPairs, planSummary);
-    bindSmartChargeTimelineTips(liveEl);
-    if (savedScrollLeft != null && savedScrollLeft > 0) {
-      const newScroll = liveEl.querySelector(".sc-timeline-scroll");
-      if (newScroll) newScroll.scrollLeft = savedScrollLeft;
+
+    // 1. Live status & plan card
+    const liveEl = settingsEl.querySelector("[data-smart-charge-live]");
+    if (liveEl) {
+      const { live, decision, dailyPlan, spreadPairs, planSummary } = this._smartChargeLivePlanContext();
+      const freshCardHtml = this._renderSmartChargeStatusCard(live, decision, dailyPlan, spreadPairs, planSummary);
+      if (liveEl.innerHTML !== freshCardHtml) {
+        const savedHostScroll = this.scrollTop;
+        const timelineScroll = liveEl.querySelector(".sc-timeline-scroll");
+        const savedScrollLeft = timelineScroll?.scrollLeft;
+        liveEl.innerHTML = freshCardHtml;
+        bindSmartChargeTimelineTips(liveEl);
+        if (savedScrollLeft != null && savedScrollLeft > 0) {
+          const newScroll = liveEl.querySelector(".sc-timeline-scroll");
+          if (newScroll) newScroll.scrollLeft = savedScrollLeft;
+        }
+        if (savedHostScroll != null && this.scrollTop !== savedHostScroll) {
+          this.scrollTop = savedHostScroll;
+        }
+      }
     }
+
+    // 2. Battery SOC limits card (if shown)
+    const plant = this._getPlant();
+    const liveSoc = this._liveBatterySoc(plant);
+    if (liveSoc != null) {
+      const socWrap = settingsEl.querySelector('[data-triple-soc-context="smart"]');
+      if (socWrap) {
+        const pctEl = socWrap.querySelector(".triple-soc-battery-pct");
+        if (pctEl && pctEl.textContent !== `${liveSoc}%`) {
+          pctEl.textContent = `${liveSoc}%`;
+        }
+        const liveMarker = socWrap.querySelector(".triple-soc-live");
+        if (liveMarker && liveMarker.style.left !== `${liveSoc}%`) {
+          liveMarker.style.left = `${liveSoc}%`;
+        }
+        const batteryEl = socWrap.querySelector(".triple-soc-battery");
+        const fillEl = batteryEl?.querySelector(".triple-soc-battery-fill");
+        if (fillEl && batteryEl) {
+          const freshFill = tripleSocBatteryFillMarkup(liveSoc);
+          const temp = document.createElement("div");
+          temp.innerHTML = freshFill;
+          const newFill = temp.firstElementChild;
+          if (newFill && fillEl.outerHTML !== newFill.outerHTML) {
+            fillEl.replaceWith(newFill);
+          }
+        }
+        const summary = socWrap.querySelector(".triple-soc-summary");
+        if (summary && this._smartChargeSocDraft) {
+          const d = clampSocDraft(this._smartChargeSocDraft);
+          const exp = d.export_min_soc ?? d.min_soc_on_grid;
+          const max = d.max_soc;
+          const freshSummary = `<strong>Export floor</strong> ${exp}% · <strong>Usable to</strong> ${max}% · <strong>Now</strong> ${liveSoc}%<br><span style="font-size:12px;color:var(--secondary-text-color)">Force-export stops at the purple handle; Self Use resumes below it</span>`;
+          if (summary.innerHTML !== freshSummary) {
+            summary.innerHTML = freshSummary;
+          }
+        }
+      }
+    }
+
     return true;
   }
 
