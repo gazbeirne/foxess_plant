@@ -167,6 +167,49 @@ def is_quota_exhausted(err: SolcastApiError) -> bool:
     return err.status == 429 and ("toomanyrequests" in text or "exceeded" in text)
 
 
+REFUSAL_PAUSE_AFTER = timedelta(hours=24)
+REFUSAL_PAUSE_FOR = timedelta(hours=24)
+REFUSAL_PAUSE_MIN_COUNT = 3
+
+
+def _parse_utc(raw: str | None) -> datetime | None:
+    parsed = dt_util.parse_datetime(raw) if raw else None
+    if parsed is None:
+        return None
+    return dt_util.as_utc(parsed) if parsed.tzinfo else parsed.replace(tzinfo=dt_util.UTC)
+
+
+def paused_until(solcast: SolcastConfig) -> datetime | None:
+    """When an automatic refusal pause ends, or None when Solcast isn't paused."""
+    until = _parse_utc(solcast.paused_until)
+    return until if until and until > dt_util.utcnow() else None
+
+
+def record_refusal(solcast: SolcastConfig) -> bool:
+    """Count an HTTP 429; pause Solcast for a day once every request for a whole day has been refused.
+
+    Returns True when this refusal started a pause. Hammering a service that keeps refusing gets keys and
+    IPs blocked (Oct 2026: a 5-minute retry loop sent ~150–200 requests in a day and a half), so after a
+    day of nothing but refusals Fox Plant goes quiet for a day, then tries once.
+    """
+    now = dt_util.utcnow()
+    solcast.refused_count += 1
+    since = _parse_utc(solcast.refused_since)
+    if since is None:
+        solcast.refused_since = now.isoformat()
+        return False
+    if now - since >= REFUSAL_PAUSE_AFTER and solcast.refused_count >= REFUSAL_PAUSE_MIN_COUNT:
+        solcast.paused_until = (now + REFUSAL_PAUSE_FOR).isoformat()
+        return True
+    return False
+
+
+def clear_refusals(solcast: SolcastConfig) -> None:
+    solcast.refused_count = 0
+    solcast.refused_since = None
+    solcast.paused_until = None
+
+
 def mark_daily_limit_reached(solcast: SolcastConfig) -> None:
     """Solcast says the daily limit is spent: treat today's quota as used up until the UTC reset."""
     reset_api_quota_if_needed(solcast)
@@ -267,6 +310,9 @@ def solcast_next_fetch(
     """Estimate when the next automatic PV poll may run (UTC ISO + status hint)."""
     if not solcast.enabled or not solcast.api_key_configured() or not solcast.fetch_pv_forecast:
         return {"at": None, "status": "disabled"}
+    pause_end = paused_until(solcast)
+    if pause_end:
+        return {"at": pause_end.isoformat(), "status": "paused"}
     if not can_consume_api(solcast, pv_calls):
         tomorrow = dt_util.utcnow().date() + timedelta(days=1)
         reset_at = datetime.combine(tomorrow, time.min, tzinfo=dt_util.UTC)
@@ -404,7 +450,7 @@ async def _fetch_rooftop_pv_forecasts(
         return None, ["No enabled PV strings in PV Configuration"], {}, 0, False
 
     if not solcast.rooftop_site_bindings:
-        await async_resolve_rooftop_bindings(hass, plant)
+        await async_resolve_rooftop_bindings(hass, plant, trigger="site lookup before a poll", manual=False)
 
     bindings = solcast.rooftop_site_bindings
     # Include tomorrow: SmartCharge decides tonight's grid charge from tomorrow's PV.
@@ -466,6 +512,9 @@ async def async_refresh_solcast(
         return cache
     if not force and not should_poll_now(hass, solcast):
         return cache
+    # A day of nothing but refusals: stay quiet until the pause ends (a manual save/test still tries)
+    if not force and paused_until(solcast):
+        return cache
 
     # Use request count as an upper bound before bindings are resolved (same quota math).
     pv_calls_estimate = max(1, len(requests))
@@ -487,7 +536,9 @@ async def async_refresh_solcast(
         try:
             from .solcast_hobbyist import async_resolve_rooftop_bindings
 
-            await async_resolve_rooftop_bindings(hass, plant)
+            await async_resolve_rooftop_bindings(
+                hass, plant, trigger="site lookup before a poll", manual=force
+            )
             bindings = solcast.rooftop_site_bindings
         except SolcastApiError as err:
             solcast.last_error = str(err)
@@ -500,7 +551,13 @@ async def async_refresh_solcast(
         solcast.last_error = "Daily API limit reached"
         return cache
 
-    client = SolcastApiClient(hass, api_key=solcast.api_key or "")
+    client = SolcastApiClient(
+        hass,
+        api_key=solcast.api_key or "",
+        solcast=solcast,
+        trigger="fetch after a settings change" if force else "scheduled poll",
+        manual=force,
+    )
     # Recorded before the request, so even an unexpected failure waits a full interval to retry
     solcast.last_attempt_at = dt_util.utcnow().isoformat()
     try:
@@ -527,6 +584,7 @@ async def async_refresh_solcast(
         cache["updated_at"] = dt_util.utcnow().isoformat()
         solcast.last_fetch_at = cache["updated_at"]
         solcast.last_error = None
+        clear_refusals(solcast)
     elif rate_limited:
         solcast.last_error = (
             f"{fetch_errors[0]} — Solcast says the daily limit is used up; "
@@ -539,6 +597,11 @@ async def async_refresh_solcast(
             "Solcast returned no PV forecast periods — check site coordinates, "
             "capacity, and that PV1 is enabled under PV Configuration"
         )
+    if not (parsed and period_count > 0) and any("HTTP 429" in e for e in fetch_errors):
+        if record_refusal(solcast):
+            until = dt_util.as_local(_parse_utc(solcast.paused_until)).strftime("%d %b %H:%M")
+            _LOGGER.warning("Solcast refused every request for a day: pausing Solcast until %s", until)
+            solcast.last_error = f"{solcast.last_error} — refused for a whole day, so paused until {until}"
     return cache
 
 
@@ -555,7 +618,7 @@ async def async_test_solcast_connection(
         return {"test_ok": False, "error": "Solcast API key is not configured"}
 
     try:
-        sites = await async_list_rooftop_sites(hass, solcast)
+        sites = await async_list_rooftop_sites(hass, solcast, trigger="connection test", manual=True)
     except SolcastApiError as err:
         solcast.last_error = str(err)
         return {

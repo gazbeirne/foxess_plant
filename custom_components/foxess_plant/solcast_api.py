@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
 import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,8 +79,52 @@ class SolcastApiError(Exception):
         self.status = status
 
 
+REQUEST_LOG_MAX = 30
+# Automatic requests (timer, background site lookup) never go out closer together than this
+MIN_AUTOMATIC_SPACING = timedelta(minutes=10)
+
+
+def _parse_utc(raw: Any) -> datetime | None:
+    parsed = dt_util.parse_datetime(str(raw)) if raw else None
+    if parsed is None:
+        return None
+    return dt_util.as_utc(parsed) if parsed.tzinfo else parsed.replace(tzinfo=dt_util.UTC)
+
+
+def gate_request(solcast: Any, *, manual: bool) -> str | None:
+    """Why a request must not go out now, or None to allow it.
+
+    Every Solcast request in Fox Plant passes here (SolcastApiClient._request), whatever started it, so the
+    pause after a day of refusals and the spacing between automatic requests hold for all of them.
+    A manual action (Save, Test connection) is the user asking, so it always goes through.
+    """
+    if manual or solcast is None:
+        return None
+    now = dt_util.utcnow()
+    until = _parse_utc(getattr(solcast, "paused_until", None))
+    if until and until > now:
+        return f"paused until {dt_util.as_local(until).strftime('%d %b %H:%M')}"
+    sent = [e for e in getattr(solcast, "request_log", None) or [] if e.get("result") != "not sent"]
+    last = _parse_utc(sent[-1].get("t")) if sent else None
+    if last and now - last < MIN_AUTOMATIC_SPACING:
+        return "less than 10 minutes since the last request"
+    return None
+
+
+def log_request(solcast: Any, *, what: str, trigger: str, result: Any) -> None:
+    """Keep the last REQUEST_LOG_MAX Solcast requests (persisted with the Solcast settings)."""
+    if solcast is None:
+        return
+    entry = {"t": dt_util.utcnow().isoformat(), "what": what, "trigger": trigger, "result": result}
+    solcast.request_log = [*(getattr(solcast, "request_log", None) or []), entry][-REQUEST_LOG_MAX:]
+
+
 class SolcastApiClient:
-    """Minimal Solcast HTTP client for Fox Plant (hobbyist / rooftop)."""
+    """Minimal Solcast HTTP client for Fox Plant (hobbyist / rooftop).
+
+    Pass ``solcast`` (the plant's SolcastConfig) so every request is gated and logged, and say what started
+    it (``trigger``) and whether the user asked for it (``manual``).
+    """
 
     def __init__(
         self,
@@ -86,13 +132,42 @@ class SolcastApiClient:
         *,
         api_key: str,
         base_url: str = SOLCAST_BASE_URL,
+        solcast: Any = None,
+        trigger: str = "",
+        manual: bool = False,
     ) -> None:
         self._hass = hass
         self._api_key = api_key.strip()
         self._base_url = base_url.rstrip("/")
         self._session = async_get_clientsession(hass)
+        self._solcast = solcast
+        self._trigger = trigger or "unspecified"
+        self._manual = manual
+        self._sent_any = False
 
     async def _request(
+        self,
+        path: str,
+        params: dict[str, Any],
+        *,
+        fallback_output: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        what = "forecast" if path.endswith("/forecasts") else "site list" if path == ROOFTOP_SITES else path
+        # One poll may ask for two arrays back to back: only its first request is gated
+        blocked = None if self._sent_any else gate_request(self._solcast, manual=self._manual)
+        self._sent_any = True
+        if blocked:
+            log_request(self._solcast, what=what, trigger=self._trigger, result="not sent")
+            raise SolcastApiError(f"Solcast request not sent: {blocked}")
+        try:
+            data = await self._send(path, params, fallback_output=fallback_output)
+        except SolcastApiError as err:
+            log_request(self._solcast, what=what, trigger=self._trigger, result=str(err)[:200])
+            raise
+        log_request(self._solcast, what=what, trigger=self._trigger, result="OK")
+        return data
+
+    async def _send(
         self,
         path: str,
         params: dict[str, Any],
@@ -121,7 +196,7 @@ class SolcastApiClient:
                     _LOGGER.debug("Retrying Solcast without weather_type parameter")
                     retry = dict(query)
                     retry["output_parameters"] = ",".join(fallback_output)
-                    return await self._request(path, retry, fallback_output=None)
+                    return await self._send(path, retry, fallback_output=None)
                 _LOGGER.warning(
                     "Solcast %s returned HTTP %s %s; headers %s; body %r",
                     path,

@@ -400,7 +400,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.508";
+const PANEL_VERSION = "0.9.509";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -1145,6 +1145,7 @@ function formatSolcastNextFetch(sc) {
   }
   const when = formatSolcastTimestamp(sc.next_fetch_at);
   if (status === "due_now") return `${when} (due now)`;
+  if (status === "paused") return `Paused after a day of refusals · next try ${when}`;
   if (status === "quota_exhausted") {
     const resetWhen = formatSolcastTimestamp(sc.next_fetch_reset_at || sc.next_fetch_at);
     const pollAt = sc.next_fetch_poll_at;
@@ -25865,6 +25866,33 @@ ${scoringHint}
 </div>`;
   }
 
+  /** Every Solcast request Fox Plant made (newest first): when, what, what started it, and Solcast's answer. */
+  _renderSolcastRequestLog(live) {
+    const log = Array.isArray(live?.request_log) ? [...live.request_log].reverse() : [];
+    const refusals = live?.refused_count
+      ? `<p class="field-hint" style="margin-top:8px">${esc(String(live.refused_count))} refusal${live.refused_count === 1 ? "" : "s"} since the last successful download${live.refused_since ? ` (first ${esc(formatSolcastTimestamp(live.refused_since))})` : ""}.</p>`
+      : "";
+    if (!log.length) {
+      return `${refusals}<p class="field-hint" style="margin-top:8px">No Solcast requests recorded yet. Every request Fox Plant makes is listed here.</p>`;
+    }
+    const rows = log
+      .map((e) => {
+        const ok = e.result === "OK";
+        const color = ok ? "" : e.result === "not sent" ? "var(--secondary-text-color)" : "var(--fp-amber, #f59e0b)";
+        const t = e.t ? new Date(e.t) : null;
+        const when = t && !Number.isNaN(t.getTime())
+          ? t.toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+          : "—";
+        return `<tr><td style="white-space:nowrap">${esc(when)}</td><td>${esc(e.what || "—")}</td><td>${esc(e.trigger || "—")}</td><td style="${color ? `color:${color}` : ""}">${esc(String(e.result ?? "—"))}</td></tr>`;
+      })
+      .join("");
+    return `${refusals}<p class="card-title" style="margin-top:16px">Request Log</p>
+<div class="octopus-greener-table-wrap"><table class="octopus-greener-table">
+<thead><tr><th>Time</th><th>Request</th><th>Started By</th><th>Result</th></tr></thead>
+<tbody>${rows}</tbody></table></div>
+<p class="field-hint" style="margin-top:6px">Every Solcast request goes through one place in Fox Plant, which records it here (last 30). Automatic requests are at least 10 minutes apart and stop for a day after a whole day of refusals.</p>`;
+  }
+
   _renderOpenMeteoCard() {
     if (!this._openMeteoDraft) this._initOpenMeteoDraft();
     const d = this._openMeteoDraft;
@@ -26008,6 +26036,7 @@ ${this._renderPvTiltAzimuthFields("pv2", { allowWhenDisabled: true })}
     )}</span></div>
 </div>
 <p class="field-hint" style="margin-top:8px"><strong>API groups</strong> (from PV config):<br>${pvReqLines}</p>
+${this._renderSolcastRequestLog(live)}
 <p class="field-hint">Diagnostic sensors expose <code>detailed_forecast</code> for automations — charts use plant state directly.</p>
 </div>
 <div class="btn-row">

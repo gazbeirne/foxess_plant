@@ -767,6 +767,12 @@ class SolcastConfig:
     last_fetch_at: str | None = None
     # Last request sent to Solcast, successful or not; spaces retries after a failure
     last_attempt_at: str | None = None
+    # Refusals (HTTP 429) since the last success, the first of them, and an automatic pause after a day of them
+    refused_count: int = 0
+    refused_since: str | None = None
+    paused_until: str | None = None
+    # Last Solcast requests: {t, what, trigger, result} — every request goes through SolcastApiClient._request
+    request_log: list[dict[str, Any]] = field(default_factory=list)
     last_error: str | None = None
     rooftop_site_bindings: dict[str, str] = field(default_factory=dict)
     rooftop_sites_meta: list[dict[str, Any]] = field(default_factory=list)
@@ -814,6 +820,10 @@ class SolcastConfig:
             api_used_date=data.get("api_used_date"),
             last_fetch_at=data.get("last_fetch_at"),
             last_attempt_at=data.get("last_attempt_at"),
+            refused_count=int(data.get("refused_count", 0) or 0),
+            refused_since=data.get("refused_since"),
+            paused_until=data.get("paused_until"),
+            request_log=[e for e in data.get("request_log") or [] if isinstance(e, dict)][-30:],
             last_error=data.get("last_error"),
             rooftop_site_bindings=bindings,
             rooftop_sites_meta=sites_meta,
@@ -833,6 +843,10 @@ class SolcastConfig:
             "api_used_date": self.api_used_date,
             "last_fetch_at": self.last_fetch_at,
             "last_attempt_at": self.last_attempt_at,
+            "refused_count": self.refused_count,
+            "refused_since": self.refused_since,
+            "paused_until": self.paused_until,
+            "request_log": list(self.request_log),
             "last_error": self.last_error,
             "rooftop_site_bindings": dict(self.rooftop_site_bindings),
             "rooftop_sites_meta": list(self.rooftop_sites_meta),

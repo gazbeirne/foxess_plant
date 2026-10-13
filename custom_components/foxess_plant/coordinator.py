@@ -5982,10 +5982,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             from .solcast_hobbyist import async_resolve_rooftop_bindings
 
             try:
-                await async_resolve_rooftop_bindings(self.hass, self.plant)
+                await async_resolve_rooftop_bindings(self.hass, self.plant, trigger="settings save", manual=True)
             except SolcastApiError as err:
                 # Solcast busy / limiting: the settings are saved; keep the sites already matched
                 if err.status != 429 or not self.plant.solcast.rooftop_site_bindings:
+                    self._persist_solcast_usage()  # keep the request log entry
                     raise HomeAssistantError(str(err)) from err
                 _LOGGER.warning("Solcast settings saved, but Solcast refused the site check: %s", err)
                 self.plant.solcast.last_error = f"Settings saved; site check refused by Solcast ({err})"
@@ -6013,6 +6014,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         test_result = await async_test_solcast_connection(
             self.hass, self.plant.solcast, plant=self.plant
         )
+        self._persist_solcast_usage()  # the test's request goes in the saved request log
         status = solcast_status_dict(
             self.plant.solcast,
             self._solcast_cache,

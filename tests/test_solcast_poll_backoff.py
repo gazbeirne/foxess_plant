@@ -116,6 +116,60 @@ async def test_no_response_still_spaces_retries_but_is_not_counted(hass, monkeyp
     assert plant.solcast.api_used_today == 0
 
 
+@pytest.mark.asyncio
+async def test_a_day_of_refusals_pauses_solcast_for_a_day_then_tries_once(hass, monkeypatch, clock) -> None:
+    calls = _fail_with(monkeypatch, 429)  # busy-style 429 on every request
+    # Daylight polling window 07:00–17:00 UTC, as in real use
+    monkeypatch.setattr(solcast_poll, "should_poll_now", lambda hass, solcast: 7 <= clock["now"].hour < 17)
+    plant = _plant(clock["now"] - timedelta(days=2))
+    start = clock["now"]
+
+    while clock["now"] < start + timedelta(hours=25):  # every 5-minute tick for 25 hours
+        await async_refresh_solcast(hass, plant, {})
+        clock["now"] += timedelta(minutes=5)
+    assert plant.solcast.paused_until is not None
+    calls_at_pause = len(calls)
+    assert "paused until" in plant.solcast.last_error
+
+    while clock["now"] < start + timedelta(hours=47):  # still inside the 24 h pause
+        await async_refresh_solcast(hass, plant, {})
+        clock["now"] += timedelta(minutes=5)
+    assert len(calls) == calls_at_pause
+
+    clock["now"] = start + timedelta(hours=49, minutes=30)  # pause over: one try, refused → paused again
+    await async_refresh_solcast(hass, plant, {})
+    await async_refresh_solcast(hass, plant, {})
+    assert len(calls) == calls_at_pause + 1
+    assert plant.solcast.paused_until is not None
+
+
+@pytest.mark.asyncio
+async def test_every_request_is_gated_and_logged(hass, monkeypatch, clock) -> None:
+    from custom_components.foxess_plant.models import SolcastConfig
+    from custom_components.foxess_plant.solcast_api import SolcastApiClient
+
+    sent: list[str] = []
+
+    async def fake_send(self, path, params, *, fallback_output=None):
+        sent.append(path)
+        return {"sites": []}
+
+    monkeypatch.setattr(SolcastApiClient, "_send", fake_send)
+    sc = SolcastConfig(enabled=True, api_key="k")
+    await SolcastApiClient(hass, api_key="k", solcast=sc, trigger="scheduled poll").list_rooftop_sites()
+    clock["now"] += timedelta(minutes=3)
+    with pytest.raises(SolcastApiError, match="10 minutes"):
+        await SolcastApiClient(hass, api_key="k", solcast=sc, trigger="site lookup before a poll").list_rooftop_sites()
+    # The user pressing Test connection always goes through
+    await SolcastApiClient(hass, api_key="k", solcast=sc, trigger="connection test", manual=True).list_rooftop_sites()
+    assert len(sent) == 2
+    assert [(e["trigger"], e["result"]) for e in sc.request_log] == [
+        ("scheduled poll", "OK"),
+        ("site lookup before a poll", "not sent"),
+        ("connection test", "OK"),
+    ]
+
+
 def test_error_text_shows_reason_and_rate_limit_headers_when_the_body_is_empty() -> None:
     from custom_components.foxess_plant.solcast_api import describe_error
 
