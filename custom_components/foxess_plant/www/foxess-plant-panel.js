@@ -1433,14 +1433,24 @@ function mergeStatisticsForecastSeries(
   range,
   plantState,
   hass,
-  { dayOffset = 0, fallbackPoints = null, forecastState = null, serverForecastPoints = null } = {}
+  {
+    dayOffset = 0,
+    fallbackPoints = null,
+    forecastState = null,
+    serverForecastPoints = null,
+    openMeteoPoints = null,
+  } = {}
 ) {
   if (!Array.isArray(series) || !range) return series;
-  const without = series.filter((s) => s.id !== "forecast");
   if (dayOffset > 0) {
+    const without = series.filter((s) => s.id !== "forecast");
     const existing = series.find((s) => s.id === "forecast");
     return existing?.points?.length >= 2 ? series : without;
   }
+  // Today: both forecasts come from the latest plant state at every redraw (the chart's own data may have
+  // loaded before the plant state did, e.g. on the Overview)
+  const without = series.filter((s) => s.id !== "forecast" && s.id !== "forecast_om");
+  pushOpenMeteoSeries(without, range, openMeteoPoints);
   const fPoints = buildStatisticsForecastPoints(range, plantState, forecastState, hass, serverForecastPoints, {
     fallbackPoints,
   });
@@ -7411,15 +7421,16 @@ const FORECAST_CHART_STYLE = {
   lineWidth: 1.2,
 };
 
-/** Open-Meteo blend: a line only (no fill), so it reads clearly over the Solcast area. */
+/** Open-Meteo blend: same shaded style as Solcast's forecast, in coral. */
 const OPEN_METEO_CHART_COLOR = "#FF7A59";
 const OPEN_METEO_CHART_STYLE = {
   label: "Open-Meteo",
   tooltipLabel: "Open-Meteo",
   legendGroup: "forecast_om",
   color: OPEN_METEO_CHART_COLOR,
-  fill: false,
-  lineWidth: 1.6,
+  fillColor: "rgba(255,122,89,0.14)",
+  fill: true,
+  lineWidth: 1.2,
 };
 
 /** Consolidated top legend (one button toggles whole group). */
@@ -16687,6 +16698,7 @@ Reloading panel registration…
         fallbackPoints: this._forecastFallbackPointsForStatistics(range),
         forecastState: chart.forecastState,
         serverForecastPoints: chart.serverForecastPoints,
+        openMeteoPoints: this._plantState?.open_meteo?.chart_points,
       }
     );
   }
