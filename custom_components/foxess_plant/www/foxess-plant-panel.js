@@ -438,7 +438,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.512";
+const PANEL_VERSION = "0.9.513";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -25432,16 +25432,16 @@ ${this._renderTariffRateBlock("standing", {
     })}
 <div class="btn-row"><button type="button" class="btn btn-primary" data-action="save-tariff-settings" ${this._busy ? "disabled" : ""}>Save Tariff</button></div>
 </div>
-${this._renderTariffImportCard(entities, currency)}
-${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
-${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
-${this._renderTariffExportCard(entities, currency)}
 <div class="card">
 <p class="card-title">Status</p>
 <p style="margin:0 0 8px;font-size:14px">${live.configured ? "Tariff configured — ready for cost analysis." : "Not configured yet — save at least one rate above."}</p>
 ${effectiveBits.length ? `<p class="field-hint" style="margin:0 0 8px">Effective rates now: ${esc(effectiveBits.join(" · "))}${bandLabel ? ` · ${esc(bandLabel)} (hour ${scheduleStatus.hour ?? "—"})` : ""}</p>` : ""}
 <p class="field-hint" style="margin:0">Last saved: ${lastUpdated}${historyCount ? ` · ${esc(String(historyCount))} rate snapshot(s) recorded` : ""}</p>
-</div>`;
+</div>
+${this._renderTariffImportCard(entities, currency)}
+${showOctopusTariffProvider(this._tariffDraft) ? this._renderOctopusSettings() : ""}
+${showEonNextTariffProvider(this._tariffDraft) ? this._renderEonNextSettings() : ""}
+${this._renderTariffExportCard(entities, currency)}`;
   }
 
   /** A Home Assistant sensor field for import / export price, with what it reads now. */
