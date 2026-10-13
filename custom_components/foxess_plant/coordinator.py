@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -133,6 +133,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._unsub_alert_log: Any = None
         # Whether the "solar forecast out of date" notification is showing (see _check_solcast_forecast_stale)
         self._solcast_stale_notified = False
+        # Open-Meteo PV forecast: {"forecast": {model: {unix: kW}}, "scores": ..., "fetched_at": ...}
+        self._open_meteo_cache: dict[str, Any] = {}
+        self._open_meteo_store: Any = None
+        self._open_meteo_lock = asyncio.Lock()
+        self._unsub_open_meteo: Any = None
         self._hems_audit_sigs: dict[str, str] = {}
         self._smart_charge_plan_meta: dict[str, Any] = {}
         self._smart_charge_target_max_soc: float | None = None
@@ -1234,6 +1239,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_config_entry_first_refresh(self) -> None:
         await self._async_load_solcast_storage()
+        await self._async_load_open_meteo()
         await self._async_load_smart_charge_pv()
         await self._async_save_smart_charge_pv()
         await self._async_load_tariff_storage()
@@ -1245,6 +1251,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._setup_schedule_timer()
         self._setup_storm_forecast_timer()
         self._setup_solcast_timer()
+        self._setup_open_meteo_timer()
         self._setup_tariff_schedule_timer()
         self._setup_octopus_timer()
         self._setup_octopus_greener_timer()
@@ -1940,16 +1947,272 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         last = dt_util.parse_datetime(sc.last_fetch_at) if sc.last_fetch_at else None
         last_text = dt_util.as_local(last).strftime("%d %b %H:%M") if last else "never"
+        backup = (
+            "SmartCharge is using the Open-Meteo forecast instead."
+            if self._open_meteo_rows()
+            else "SmartCharge is estimating tomorrow's solar from a previous day, so tonight's grid charge may be "
+            "too big or too small. Turn on Open-Meteo under Settings → Solar forecast as a backup."
+        )
         message = (
             f"No new Solcast PV forecast since {last_text}"
             + (f" (last error: {sc.last_error})" if sc.last_error else "")
-            + ". SmartCharge is estimating tomorrow's solar from a previous day, so tonight's grid "
-            "charge may be too big or too small. Check your Solcast API usage at toolkit.solcast.com.au."
+            + f". {backup} Check your Solcast API usage at toolkit.solcast.com.au."
         )
         _LOGGER.warning("Solcast PV forecast is out of date: %s", message)
         persistent_notification.async_create(
             self.hass, message, title="FoxESS Plant: solar forecast out of date", notification_id=notification_id
         )
+
+    # ---- Open-Meteo PV forecast ------------------------------------------------------------------
+    # Several weather models from Open-Meteo, scored day-ahead against this plant's real PV and blended
+    # (open_meteo.py). Backup to Solcast, or the main source. Persisted in .storage so a restart never
+    # fetches early.
+
+    def _open_meteo_store_handle(self):
+        if self._open_meteo_store is None:
+            from homeassistant.helpers.storage import Store
+
+            from .const import DOMAIN
+
+            self._open_meteo_store = Store(self.hass, 1, f"{DOMAIN}.open_meteo.{self.config_entry.entry_id}")
+        return self._open_meteo_store
+
+    async def _async_load_open_meteo(self) -> None:
+        try:
+            data = await self._open_meteo_store_handle().async_load()
+        except Exception:
+            _LOGGER.exception("Open-Meteo forecast store read failed")
+            return
+        if not isinstance(data, dict):
+            return
+        forecast = data.get("forecast") if isinstance(data.get("forecast"), dict) else {}
+        data["forecast"] = {
+            m: {int(ts): float(kw) for ts, kw in series.items()}
+            for m, series in forecast.items()
+            if isinstance(series, dict)
+        }
+        self._open_meteo_cache = data
+
+    def _save_open_meteo(self) -> None:
+        cache = dict(self._open_meteo_cache)
+        cache["forecast"] = {
+            m: {str(ts): kw for ts, kw in series.items()} for m, series in (cache.get("forecast") or {}).items()
+        }
+        self._open_meteo_store_handle().async_delay_save(lambda: cache, 2)
+
+    def _open_meteo_location(self) -> tuple[float, float] | None:
+        from .solcast_weather import parse_solcast_coordinates
+
+        coords = parse_solcast_coordinates(self.plant.solcast.latitude, self.plant.solcast.longitude)
+        if coords:
+            return coords
+        lat, lon = self.hass.config.latitude, self.hass.config.longitude
+        return (float(lat), float(lon)) if lat is not None and lon is not None else None
+
+    def _setup_open_meteo_timer(self) -> None:
+        if self._unsub_open_meteo:
+            self._unsub_open_meteo()
+            self._unsub_open_meteo = None
+        self._unsub_open_meteo = async_track_time_interval(
+            self.hass, self._open_meteo_timer_callback, timedelta(minutes=10)
+        )
+        # Fetches only if the persisted fetch time says one is due
+        self.hass.async_create_task(self._async_refresh_open_meteo())
+
+    @callback
+    def _open_meteo_timer_callback(self, _now) -> None:
+        self.hass.async_create_task(self._async_refresh_open_meteo())
+
+    def _open_meteo_due(self, key: str, every: timedelta) -> bool:
+        from homeassistant.util import dt as dt_util
+
+        raw = self._open_meteo_cache.get(key)
+        last = dt_util.parse_datetime(raw) if raw else None
+        return last is None or dt_util.utcnow() - last >= every
+
+    async def _async_refresh_open_meteo(self, *, force: bool = False) -> None:
+        """Fetch the forecast hourly and re-score the models twice a day (both only when enabled)."""
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        from homeassistant.util import dt as dt_util
+
+        from . import open_meteo as om
+        from .smart_charge.engine import local_tz
+
+        cfg = self.plant.open_meteo
+        if not cfg.enabled:
+            return
+        location = self._open_meteo_location()
+        arrays = om.plant_arrays(self.plant.pv_config)
+        if location is None or not arrays:
+            self._open_meteo_cache["last_error"] = (
+                "Set a location (Solcast site or Home Assistant home) and enable a PV string in PV Configuration"
+            )
+            return
+        session = async_get_clientsession(self.hass)
+        changed = False
+        async with self._open_meteo_lock:
+            if force or self._open_meteo_due("fetched_at", om.FORECAST_REFRESH):
+                try:
+                    forecast = await om.async_fetch_forecast(session, *location, arrays, list(cfg.models))
+                except om.OpenMeteoError as err:
+                    self._open_meteo_cache["last_error"] = str(err)
+                    self._open_meteo_cache["fetched_at"] = dt_util.utcnow().isoformat()  # retry next hour
+                    _LOGGER.warning("Open-Meteo forecast fetch failed: %s", err)
+                else:
+                    self._open_meteo_cache.update(
+                        forecast=forecast, fetched_at=dt_util.utcnow().isoformat(), last_error=None
+                    )
+                    changed = True
+            if force or self._open_meteo_due("scored_at", om.SCORE_REFRESH):
+                tz = local_tz()
+                today = dt_util.now().date()
+                start = today - timedelta(days=om.SCORE_DAYS)
+                try:
+                    predicted = await om.async_fetch_day_ahead_daily(
+                        session, *location, arrays, list(cfg.models), start=start, end=today - timedelta(days=1), tz=tz
+                    )
+                    actual = await self._async_actual_daily_pv(start, today)
+                except om.OpenMeteoError as err:
+                    self._open_meteo_cache["score_error"] = str(err)
+                    _LOGGER.warning("Open-Meteo scoring failed: %s", err)
+                except Exception as err:  # noqa: BLE001 — recorder may be unavailable
+                    self._open_meteo_cache["score_error"] = str(err)
+                    _LOGGER.warning("Open-Meteo scoring failed: %s", err)
+                else:
+                    scores = om.score_models(predicted, actual)
+                    self._open_meteo_cache.update(
+                        scores=scores,
+                        blend_mae_kwh=om.blend_mae(predicted, actual, scores, list(cfg.models)),
+                        scored_days=len(actual),
+                        scored_at=dt_util.utcnow().isoformat(),
+                        score_error=None,
+                    )
+                    changed = True
+            self._save_open_meteo()
+        if changed:
+            await self.async_request_refresh()
+
+    async def _async_actual_daily_pv(self, start: date, end: date) -> dict[str, float]:
+        """kWh per complete local day from the PV energy counters' hourly statistics (pv1 + pv2)."""
+        from homeassistant.components.recorder import get_instance
+        from homeassistant.util import dt as dt_util
+
+        from .discovery import resolve_entity_id
+        from .smart_charge.engine import local_tz
+        from .websocket_api import _fetch_statistics_points
+
+        tz = local_tz()
+        ids: dict[str, float] = {}
+        for key in ("pv1_energy_total", "pv2_energy_total"):
+            entity_id = resolve_entity_id(self.hass, self.plant.entity_map, key, device_id=self.plant.device_id)
+            scale = {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0}.get((self._entity_unit(key) or "").strip())
+            if entity_id and scale:
+                ids[entity_id] = scale
+        if not ids:
+            return {}
+        begin = datetime.combine(start, datetime.min.time(), tz) - timedelta(hours=1)
+        finish = datetime.combine(end, datetime.min.time(), tz)
+        stats = await get_instance(self.hass).async_add_executor_job(
+            _fetch_statistics_points, self.hass, begin, finish, list(ids), "hour", "sum"
+        )
+        per_day: dict[str, float] = {}
+        hours: dict[str, set[float]] = {}
+        for entity_id, scale in ids.items():
+            rows = stats.get(entity_id) or []
+            for a, b in zip(rows, rows[1:]):
+                delta = (b["mean"] - a["mean"]) * scale
+                if b["start"] - a["start"] != 3600 or delta < 0 or delta > 50:
+                    continue
+                day = dt_util.as_local(dt_util.utc_from_timestamp(b["start"])).astimezone(tz).date().isoformat()
+                per_day[day] = per_day.get(day, 0.0) + delta
+                hours.setdefault(day, set()).add(b["start"])
+        # Only days the counters covered in full (a gap would understate the day)
+        return {d: round(v, 2) for d, v in per_day.items() if len(hours.get(d, ())) >= 22}
+
+    def _open_meteo_rows(self) -> list[dict[str, Any]]:
+        from homeassistant.util import dt as dt_util
+
+        from .open_meteo import blend_rows
+
+        cfg = self.plant.open_meteo
+        forecast = self._open_meteo_cache.get("forecast") or {}
+        if not cfg.enabled or not forecast:
+            return []
+        return blend_rows(forecast, self._open_meteo_cache.get("scores") or {}, list(cfg.models), now=dt_util.utcnow())
+
+    def _solcast_fresh(self) -> bool:
+        from homeassistant.util import dt as dt_util
+
+        from .open_meteo import SOLCAST_FRESH
+
+        raw = self.plant.solcast.last_fetch_at
+        last = dt_util.parse_datetime(raw) if raw else None
+        return last is not None and dt_util.utcnow() - dt_util.as_utc(last) < SOLCAST_FRESH
+
+    def _open_meteo_state(self) -> dict[str, Any]:
+        from homeassistant.util import dt as dt_util
+
+        from . import open_meteo as om
+        from .smart_charge.engine import local_tz
+
+        cfg = self.plant.open_meteo
+        cache = self._open_meteo_cache
+        scores = cache.get("scores") or {}
+        models = list(cfg.models)
+        weights = om.model_weights(scores, [m for m in models if (cache.get("forecast") or {}).get(m)])
+        tz = local_tz()
+        today = dt_util.now().date()
+        days = [(today + timedelta(days=i)).isoformat() for i in range(2)]
+        totals = om.model_day_totals(cache.get("forecast") or {}, scores, models, tz)
+        blend_daily: dict[str, float] = {}
+        for row in self._open_meteo_rows():
+            end = dt_util.parse_datetime(row["period_end"])
+            day = dt_util.as_local(end - om.HALF_HOUR).date().isoformat()
+            blend_daily[day] = blend_daily.get(day, 0.0) + float(row["pv_estimate"]) * 0.5
+        location = self._open_meteo_location()
+        return {
+            **cfg.to_dict(),
+            "model_options": [{"id": m, "label": om.MODEL_LABELS[m]} for m in om.MODEL_LABELS],
+            "location": {"latitude": location[0], "longitude": location[1]} if location else None,
+            "location_source": "solcast"
+            if self.plant.solcast.latitude is not None and self.plant.solcast.longitude is not None
+            else "home",
+            "arrays": [a.__dict__ for a in om.plant_arrays(self.plant.pv_config)],
+            "fetched_at": cache.get("fetched_at"),
+            "scored_at": cache.get("scored_at"),
+            "scored_days": cache.get("scored_days"),
+            "last_error": cache.get("last_error"),
+            "score_error": cache.get("score_error"),
+            "blend_mae_kwh": cache.get("blend_mae_kwh"),
+            "min_scored_days": om.MIN_SCORED_DAYS,
+            "models_detail": [
+                {
+                    "id": m,
+                    "label": om.MODEL_LABELS.get(m, m),
+                    "mae_kwh": (scores.get(m) or {}).get("mae_kwh"),
+                    "days": (scores.get(m) or {}).get("days", 0),
+                    "factor": (scores.get(m) or {}).get("factor"),
+                    "weight": round(weights.get(m, 0.0), 3),
+                    "day_kwh": {d: (totals.get(m) or {}).get(d) for d in days},
+                }
+                for m in models
+            ],
+            "blend_day_kwh": {d: round(blend_daily[d], 1) if d in blend_daily else None for d in days},
+            "days": days,
+            "solcast_fresh": self._solcast_fresh(),
+        }
+
+    async def async_save_open_meteo(self, *, open_meteo: dict[str, Any]) -> None:
+        from .models import OpenMeteoConfig
+
+        merged = {**self.plant.open_meteo.to_dict(), **open_meteo}
+        data = dict(self.config_entry.data)
+        data["open_meteo"] = OpenMeteoConfig.from_dict(merged).to_dict()
+        self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+        self.update_plant_config(PlantConfig.from_entry_data(data))
+        if self.plant.open_meteo.enabled:
+            await self._async_refresh_open_meteo(force=True)
+        await self.async_request_refresh()
 
     async def _async_refresh_storm_weather(self) -> None:
         """Re-evaluate StormSafe using Google Weather (hourly forecast + condition sensors)."""
@@ -2548,6 +2811,17 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
 
     def _smart_charge_forecast_rows(self) -> list[dict[str, Any]]:
+        """Solcast (latest poll + history + SmartCharge's persisted rows) combined with Open-Meteo."""
+        from .open_meteo import combine_forecasts
+
+        return combine_forecasts(
+            self._smart_charge_solcast_rows(),
+            self._open_meteo_rows(),
+            primary=self.plant.open_meteo.primary,
+            solcast_fresh=self._solcast_fresh(),
+        )
+
+    def _smart_charge_solcast_rows(self) -> list[dict[str, Any]]:
         from homeassistant.util import dt as dt_util
 
         from .smart_charge.planner import merge_forecast_snapshots
@@ -2602,7 +2876,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "period_end": r.get("period_end"),
                 "pv_estimate": r.get("pv_estimate"),
             }
-            for r in self._smart_charge_forecast_rows()
+            # Solcast only: Open-Meteo rows are rebuilt from their own store
+            for r in self._smart_charge_solcast_rows()
             if not r.get("estimated")
         ]
         if len(rows) < 2:
@@ -2781,6 +3056,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         meta["capacity_source"] = capacity_source
         meta["rates_sig"] = plan_rates_signature(import_rows, now)
         meta["forecast_sig"] = forecast_signature(forecast_rows)
+        meta["tomorrow_pv_source"] = self._forecast_source_tomorrow(forecast_rows)
         meta["replan_reason"] = reason
         self._smart_charge_daily_plan = plan
         self._smart_charge_plan_meta = meta
@@ -2792,6 +3068,16 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             meta.get("saving_p") or 0.0,
         )
         self._audit_smart_charge_daily_plan()
+
+    @staticmethod
+    def _forecast_source_tomorrow(rows: list[dict[str, Any]]) -> str | None:
+        """"solcast" / "open_meteo" for tomorrow midday, None when neither covers it (estimated)."""
+        from homeassistant.util import dt as dt_util
+
+        from .open_meteo import source_at
+
+        noon = (dt_util.now() + timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+        return source_at(rows, dt_util.as_utc(noon))
 
     def _audit_smart_charge_daily_plan(self) -> None:
         from .performance.hems_audit import (
@@ -3307,6 +3593,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "panel_display": self.plant.panel_display.to_dict(),
             "pv_config": self.plant.pv_config.to_dict(),
             "solcast": self._solcast_state(),
+            "open_meteo": self._open_meteo_state(),
             "glow": self._glow_state(),
             "fox_cloud": self._fox_cloud_state(),
             "battery_warmup": self._battery_warmup_state(),
@@ -5696,6 +5983,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if getattr(self, "_unsub_solcast", None):
             self._unsub_solcast()
             self._unsub_solcast = None
+        if getattr(self, "_unsub_open_meteo", None):
+            self._unsub_open_meteo()
+            self._unsub_open_meteo = None
         if self._unsub_triggers:
             self._unsub_triggers()
             self._unsub_triggers = None

@@ -135,7 +135,7 @@ function normalizePanelView(view) {
 const SETTINGS_NAV = [
   { id: "main", label: "All" },
   { id: "fox-api", label: "Fox API" },
-  { id: "solcast", label: "Solcast" },
+  { id: "solcast", label: "Solar forecast" },
   { id: "glow", label: "Glow meter" },
   { id: "tariff", label: "Tariff" },
   { id: "weather", label: "Weather" },
@@ -400,7 +400,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.504";
+const PANEL_VERSION = "0.9.505";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -8914,12 +8914,14 @@ function renderSmartChargeStatTiles(decision) {
   if (decision.grid_gap_kwh != null) {
     tiles.push({ label: "Planned grid charge", value: `${Number(decision.grid_gap_kwh).toFixed(1)} kWh` });
   }
+  const pvSource =
+    summary.tomorrow_pv_source === "open_meteo" ? " · Open-Meteo" : summary.tomorrow_pv_source === "solcast" ? " · Solcast" : "";
   if (summary.tomorrow_pv_estimated && summary.tomorrow_pv_kwh != null) {
     tiles.push({ label: "Tomorrow PV (est.)", value: `${Number(summary.tomorrow_pv_kwh).toFixed(1)} kWh` });
   } else if (summary.tomorrow_pv_known === false) {
     tiles.push({ label: "Tomorrow PV", value: "Awaiting forecast" });
   } else if (summary.tomorrow_pv_kwh != null) {
-    tiles.push({ label: "Tomorrow PV", value: `${Number(summary.tomorrow_pv_kwh).toFixed(1)} kWh` });
+    tiles.push({ label: `Tomorrow PV${pvSource}`, value: `${Number(summary.tomorrow_pv_kwh).toFixed(1)} kWh` });
   }
   if (summary.tomorrow_load_kwh != null) {
     tiles.push({ label: "Tomorrow load", value: `${Number(summary.tomorrow_load_kwh).toFixed(1)} kWh` });
@@ -16210,6 +16212,10 @@ Reloading panel registration…
       if (this._settingsView !== "tariff") this._tariffDraft = null;
       if (!this._isSmartChargeView()) this._smartChargeDraft = null;
       if (this._settingsView !== "glow") this._glowDraft = null;
+      if (this._settingsView !== "solcast") {
+        this._openMeteoDraft = null;
+        this._solcastDirty = false;
+      }
       if (
         this._settingsView === "solcast" &&
         this._solcastDraft &&
@@ -18001,6 +18007,22 @@ Reloading panel registration…
     this._initPvDraft();
   }
 
+  _initOpenMeteoDraft() {
+    const om = this._plantState?.open_meteo ?? {};
+    this._openMeteoDraft = {
+      enabled: Boolean(om.enabled),
+      primary: om.primary === "open_meteo" ? "open_meteo" : "solcast",
+      models: Array.isArray(om.models) ? [...om.models] : [],
+    };
+  }
+
+  /** Solar forecast page: remember whether Solcast / PV fields changed, so saving Open-Meteo alone doesn't
+   * spend a Solcast API call (a Solcast or PV save fetches straight away). */
+  _markSolarForecastDirty(kind) {
+    if (this._settingsView !== "solcast") return;
+    if (kind === "solcast" || kind === "pv") this._solcastDirty = true;
+  }
+
   _initGlowDraft() {
     const g = this._plantState?.glow ?? {};
     this._glowDraft = {
@@ -18436,12 +18458,16 @@ Reloading panel registration…
 
   _solcastSettingsSubtitle() {
     const sc = this._plantState?.solcast;
-    if (!solcastEnabledFromLive(sc)) return "Off";
-    if (!sc.api_key_set) return "API key required";
-    if (!sc.coordinates_configured) return "Solcast site latitude/longitude required";
-    if (!sc.hobbyist_sites_resolved) return "Linking to Solcast Home PV site(s)… save settings";
-    const rem = sc.api_remaining ?? "—";
-    return `PV forecast · ${sc.api_used_today ?? 0}/${sc.api_limit ?? 10} API calls today · ${rem} left`;
+    const om = this._plantState?.open_meteo;
+    const omText = om?.enabled ? "Open-Meteo on" : "";
+    let scText;
+    if (!solcastEnabledFromLive(sc)) scText = "Solcast off";
+    else if (!sc.api_key_set) scText = "Solcast API key required";
+    else if (!sc.coordinates_configured) scText = "Solcast site latitude/longitude required";
+    else if (!sc.hobbyist_sites_resolved) scText = "Linking to Solcast Home PV site(s)… save settings";
+    else if (om?.enabled && !om.solcast_fresh) scText = "Solcast not updating";
+    else scText = `Solcast ${sc.api_used_today ?? 0}/${sc.api_limit ?? 10} calls today`;
+    return [scText, omText].filter(Boolean).join(" · ");
   }
 
   async _saveSolcastSettings() {
@@ -18452,9 +18478,27 @@ Reloading panel registration…
     this._render();
     try {
       const draft = this._solcastDraft;
-      const validationErr = validateSolcastDraft(draft);
+      const om = this._openMeteoDraft;
+      if (om?.enabled && !om.models.length) {
+        this._showToast("Pick at least one Open-Meteo weather model.", "err");
+        return;
+      }
+      const validationErr = this._solcastDirty ? validateSolcastDraft(draft) : null;
       if (validationErr) {
         this._showToast(validationErr, "err");
+        return;
+      }
+      if (om) {
+        const omState = await this._hass.connection.sendMessagePromise({
+          type: "foxess_plant/update_open_meteo",
+          plant_id: plant.entry_id,
+          open_meteo: { enabled: Boolean(om.enabled), primary: om.primary, models: om.models },
+        });
+        if (omState) this._plantState = omState;
+        this._initOpenMeteoDraft();
+      }
+      if (!this._solcastDirty) {
+        this._showToast("Solar forecast settings saved");
         return;
       }
       const lat = normalizeSolcastCoordinateInput(draft.latitude);
@@ -18488,7 +18532,8 @@ Reloading panel registration…
         this._initPvDraft();
       }
       this._initSolcastDraft();
-      this._showToast("Solcast settings saved");
+      this._solcastDirty = false;
+      this._showToast("Solar forecast settings saved");
       this._reloadStatisticsChartWhenVisible();
     } catch (err) {
       this._showToast(err?.message || "Save failed", "err");
@@ -19411,6 +19456,17 @@ Reloading panel registration…
     }
     if (el?.dataset?.field) {
       const parts = el.dataset.field.split(":");
+      this._markSolarForecastDirty(parts[0]);
+      if (parts[0] === "open-meteo" && this._openMeteoDraft) {
+        const d = this._openMeteoDraft;
+        if (parts[1] === "enabled") d.enabled = el.checked;
+        else if (parts[1] === "primary") d.primary = el.value === "open_meteo" ? "open_meteo" : "solcast";
+        else if (parts[1] === "model" && parts[2]) {
+          d.models = el.checked ? [...new Set([...d.models, parts[2]])] : d.models.filter((m) => m !== parts[2]);
+        }
+        this._scheduleRender();
+        return;
+      }
       if (parts[0] === "solcast" && this._solcastDraft) {
         if (parts[1] === "enabled") {
           this._solcastDraft.enabled = el.checked;
@@ -19655,6 +19711,7 @@ Reloading panel registration…
     if (!el?.dataset?.field) return;
     const parts = el.dataset.field.split(":");
     const kind = parts[0];
+    this._markSolarForecastDirty(kind);
     if (kind === "storm-behaviour" && this._stormDraft) {
       const field = parts[1];
       if (field !== "enable_force_charge" && field !== "enable_charge_from_grid") return;
@@ -24631,13 +24688,17 @@ ${body}
 
   _renderSmartChargeSolcastLine(summary) {
     const sc = this._plantState?.solcast;
-    if (!nativeSolcastPvForecastEnabled(this._plantState)) return "";
-    const last = formatSolcastTimestamp(sc.cache_updated_at || sc.last_fetch_at);
-    const next = formatSolcastNextFetch(sc);
-    const est = summary.tomorrow_pv_estimated
-      ? " · tomorrow's PV estimated from the same time yesterday until the next poll"
-      : "";
-    return `<p class="field-hint" style="margin:6px 0 0">${esc(`Solcast: last fetch ${last} · next fetch ${next}${est}`)}</p>`;
+    const om = this._plantState?.open_meteo;
+    const parts = [];
+    if (nativeSolcastPvForecastEnabled(this._plantState)) {
+      const last = formatSolcastTimestamp(sc.cache_updated_at || sc.last_fetch_at);
+      parts.push(`Solcast: last fetch ${last} · next fetch ${formatSolcastNextFetch(sc)}`);
+    }
+    if (om?.enabled) parts.push(`Open-Meteo: last fetch ${formatSolcastTimestamp(om.fetched_at)}`);
+    if (summary.tomorrow_pv_source === "open_meteo") parts.push("tomorrow's PV from Open-Meteo");
+    else if (summary.tomorrow_pv_estimated) parts.push("tomorrow's PV estimated from the same time yesterday until the next poll");
+    if (!parts.length) return "";
+    return `<p class="field-hint" style="margin:6px 0 0">${esc(parts.join(" · "))}</p>`;
   }
 
   _renderSmartChargeStatusCard(live, decision, dailyPlan, spreadPairs, planSummary) {
@@ -25636,8 +25697,113 @@ ${detailBlock}
 </div>`;
   }
 
+  /** Which forecast SmartCharge uses, and how each provider / model compares on this plant. */
+  _renderSolarForecastComparisonCard() {
+    const sc = this._plantState?.solcast ?? {};
+    const om = this._plantState?.open_meteo ?? {};
+    const meta = this._plantState?.smart_charge?.plan_meta ?? {};
+    const fmt = (v) => (v == null || !Number.isFinite(Number(v)) ? "—" : Number(v).toFixed(1));
+    const [today, tomorrow] = om.days ?? [];
+    const solcastOn = solcastEnabledFromLive(sc) && sc.fetch_pv_forecast !== false;
+    const source = meta.tomorrow_pv_source;
+    const inUse =
+      source === "open_meteo"
+        ? "Open-Meteo"
+        : source === "solcast"
+          ? "Solcast"
+          : "Estimate from a previous day (no forecast reaches tomorrow)";
+    const solcastStatus = !solcastOn
+      ? "Off"
+      : om.solcast_fresh
+        ? `Up to date · last fetch ${formatSolcastTimestamp(sc.cache_updated_at || sc.last_fetch_at)}`
+        : `Not updating · last fetch ${formatSolcastTimestamp(sc.cache_updated_at || sc.last_fetch_at)}${sc.last_error ? ` · ${sc.last_error}` : ""}`;
+    const omStatus = !om.enabled
+      ? "Off"
+      : om.last_error
+        ? `Error · ${om.last_error}`
+        : `Last fetch ${formatSolcastTimestamp(om.fetched_at)} · scored on ${om.scored_days ?? 0} days`;
+    const rows = [];
+    if (solcastOn) {
+      const fresh = om.solcast_fresh !== false;
+      const role = !om.enabled ? "Only source" : om.primary === "open_meteo" ? "Backup" : fresh ? "Preferred" : "Stale";
+      rows.push(
+        `<tr><td><strong>Solcast</strong></td><td>${fresh ? fmt(sc.forecast_today_kwh) : "—"}</td><td>${fresh ? fmt(sc.forecast_tomorrow_kwh) : "—"}</td><td>—</td><td>${esc(role)}</td></tr>`
+      );
+    }
+    if (om.enabled) {
+      rows.push(
+        `<tr><td><strong>Open-Meteo blend</strong></td><td>${fmt(om.blend_day_kwh?.[today])}</td><td>${fmt(om.blend_day_kwh?.[tomorrow])}</td><td>${fmt(om.blend_mae_kwh)}</td><td>${!solcastOn ? "Only source" : om.primary === "open_meteo" ? "Preferred" : om.solcast_fresh === false ? "In use" : "Backup"}</td></tr>`
+      );
+      for (const m of om.models_detail ?? []) {
+        const err = m.mae_kwh != null ? fmt(m.mae_kwh) : m.days ? `${m.days} d so far` : "—";
+        rows.push(
+          `<tr><td style="padding-left:24px">${esc(m.label)}</td><td>${fmt(m.day_kwh?.[today])}</td><td>${fmt(m.day_kwh?.[tomorrow])}</td><td>${esc(err)}</td><td>${m.weight ? `${Math.round(m.weight * 100)}%` : "—"}</td></tr>`
+        );
+      }
+    }
+    const table = rows.length
+      ? `<div class="octopus-greener-table-wrap"><table class="octopus-greener-table">
+<thead><tr><th>Forecast</th><th>Today</th><th>Tomorrow</th><th title="Average difference between the forecast made a day ahead and what the panels produced, over the last 30 days">Error</th><th>Share</th></tr></thead>
+<tbody>${rows.join("")}</tbody></table></div>`
+      : `<p class="field-hint">Turn on Solcast or Open-Meteo below.</p>`;
+    const scoringHint = om.enabled
+      ? `<p class="field-hint" style="margin-top:8px">All figures in kWh. <strong>Error</strong> is how far each model's forecast, made a day ahead, was from what your panels actually produced, on average over the last 30 days. The blend gives more weight to the more accurate models; until a model has ${esc(String(om.min_scored_days ?? 7))} scored days the models share equally.</p>`
+      : `<p class="field-hint" style="margin-top:8px">All figures in kWh.</p>`;
+    return `<div class="card">
+<p class="card-title">Forecast in use</p>
+<div class="entity-list">
+<div class="entity-row"><span class="entity-name">SmartCharge uses for tomorrow</span><span class="entity-value"><strong>${esc(inUse)}</strong></span></div>
+<div class="entity-row"><span class="entity-name">Solcast</span><span class="entity-value">${esc(solcastStatus)}</span></div>
+<div class="entity-row"><span class="entity-name">Open-Meteo</span><span class="entity-value">${esc(omStatus)}</span></div>
+</div>
+${table}
+${scoringHint}
+</div>`;
+  }
+
+  _renderOpenMeteoCard() {
+    if (!this._openMeteoDraft) this._initOpenMeteoDraft();
+    const d = this._openMeteoDraft;
+    const live = this._plantState?.open_meteo ?? {};
+    const dis = this._busy ? "disabled" : "";
+    const loc = live.location
+      ? `${Number(live.location.latitude).toFixed(4)}, ${Number(live.location.longitude).toFixed(4)} (${live.location_source === "solcast" ? "Solcast site location" : "Home Assistant home location"})`
+      : "Not set";
+    const arrays = (live.arrays ?? [])
+      .map((a) => `${Number(a.kwp).toFixed(2)} kWp · ${a.tilt}° tilt · facing ${(a.azimuth + 180 + 360) % 360}°`)
+      .join("<br>");
+    const scoreById = Object.fromEntries((live.models_detail ?? []).map((m) => [m.id, m]));
+    const models = (live.model_options ?? [])
+      .map((opt) => {
+        const s = scoreById[opt.id];
+        const note = s?.mae_kwh != null ? ` · day-ahead error ${Number(s.mae_kwh).toFixed(1)} kWh` : "";
+        return `<div class="toggle-row"><span>${esc(opt.label)}<span style="font-size:12px;color:var(--secondary-text-color)">${esc(note)}</span></span>
+<input type="checkbox" data-field="open-meteo:model:${esc(opt.id)}" ${d.models.includes(opt.id) ? "checked" : ""} ${dis}></div>`;
+      })
+      .join("");
+    const options = d.enabled
+      ? `<div class="field" style="margin-top:12px"><label>Preferred forecast for SmartCharge</label>
+<select data-field="open-meteo:primary" ${dis}>
+<option value="solcast" ${d.primary === "solcast" ? "selected" : ""}>Solcast — Open-Meteo fills gaps and takes over when Solcast hasn't updated for 24 h</option>
+<option value="open_meteo" ${d.primary === "open_meteo" ? "selected" : ""}>Open-Meteo — Solcast only fills gaps</option>
+</select></div>
+<p class="card-title" style="margin-top:16px">Weather models</p>
+<p class="field-hint" style="margin:0 0 6px">Fetched together in one request per hour. Keep several: the blend is steadier than any single model.</p>
+${models}
+<p class="field-hint" style="margin-top:12px">Location: <strong>${esc(loc)}</strong><br>Arrays (from PV Configuration):<br>${arrays || "Enable a PV string in PV Configuration"}</p>`
+      : "";
+    return `<div class="card">
+<p class="card-title">Open-Meteo</p>
+<p class="field-hint" style="margin:0 0 8px"><a class="field-link" href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">Open-Meteo</a> is free for non-commercial use with no account or API key. Fox Plant sends it your location and panel tilt and direction, and turns its sunlight forecast into kWh using PV Configuration and your panels' measured output.</p>
+<div class="toggle-row"><span><strong>Use Open-Meteo</strong><br><span style="font-size:12px;color:var(--secondary-text-color)">Backup when Solcast fails, or your main forecast</span></span>
+<input type="checkbox" data-field="open-meteo:enabled" ${d.enabled ? "checked" : ""} ${dis}></div>
+${options}
+</div>`;
+  }
+
   _renderSettingsSolcast() {
     if (!this._solcastDraft) this._initSolcastDraft();
+    if (!this._openMeteoDraft) this._initOpenMeteoDraft();
     const draft = this._solcastDraft;
     const live = this._plantState?.solcast ?? {};
     const coordConfigured = Boolean(live.coordinates_configured);
@@ -25680,9 +25846,12 @@ ${detailBlock}
     } else if (sched && draft.auto_update === "all_day") {
       scheduleHint = `<p class="field-hint">24 h mode: about <strong>${esc(String(sched.interval_minutes ?? "—"))}</strong> min between refreshes.</p>`;
     }
-    return `<header class="header"><h1>Solcast</h1><p><a class="field-link" href="${esc(SOLCAST_API_DOCS_URL)}" target="_blank" rel="noopener noreferrer">Solcast hobbyist API</a> for <strong>rooftop PV forecast</strong> only — overview weather and StormSafe stay on Google Weather.</p></header>
+    return `<header class="header"><h1>Solar forecast</h1><p>SmartCharge sizes the overnight grid charge from tomorrow's solar forecast. Use Solcast, Open-Meteo or both: Fox Plant compares them with what your panels actually produce and switches to Open-Meteo by itself when Solcast stops updating. Overview weather and StormSafe stay on Google Weather.</p></header>
+${this._renderSolarForecastComparisonCard()}
+${this._renderOpenMeteoCard()}
 <div class="card">
-<p class="card-title">Auto update</p>
+<p class="card-title">Solcast · auto update</p>
+<p class="field-hint" style="margin:0 0 8px"><a class="field-link" href="${esc(SOLCAST_API_DOCS_URL)}" target="_blank" rel="noopener noreferrer">Solcast hobbyist API</a> (free account, 10 requests a day).</p>
 <div class="field"><label>Schedule</label>
 <select data-field="solcast:auto_update" ${this._busy ? "disabled" : ""}>
 <option value="daylight" ${draft.auto_update === "daylight" ? "selected" : ""}>Automatic update of forecasts from sunrise to sunset</option>
@@ -25696,7 +25865,7 @@ ${scheduleHint}
 ${this._renderSolcastApiCredentialsCard()}
 <div class="card">
 <p class="card-title">Rooftop tilt &amp; azimuth</p>
-<p class="field-hint" style="margin:0">Used for each enabled PV string on the Solcast API. Panel count, wattage, and efficiency are under <strong>Settings → PV Configuration</strong>. Saved together when you press <strong>Save</strong> below.</p>
+<p class="field-hint" style="margin:0">Used for each enabled PV string by Solcast and Open-Meteo. Panel count, wattage, and efficiency are under <strong>Settings → PV Configuration</strong>. Saved together when you press <strong>Save</strong> below.</p>
 ${this._renderPvTiltAzimuthFields("pv1", { allowWhenDisabled: true })}
 ${this._renderPvTiltAzimuthFields("pv2", { allowWhenDisabled: true })}
 </div>
@@ -25717,7 +25886,7 @@ ${this._renderPvTiltAzimuthFields("pv2", { allowWhenDisabled: true })}
 <input type="text" data-field="solcast:period" value="${esc(String(draft.period))}" readonly></div>
 </div>
 <div class="card">
-<p class="card-title">Status</p>
+<p class="card-title">Solcast status</p>
 <div class="entity-list">
 <div class="entity-row"><span class="entity-name">API used today</span><span class="entity-value">${esc(String(live.api_used_today ?? 0))} / ${esc(String(live.api_limit ?? draft.api_limit))}</span></div>
 <div class="entity-row"><span class="entity-name">Remaining today</span><span class="entity-value">${esc(String(live.api_remaining ?? "—"))}</span></div>

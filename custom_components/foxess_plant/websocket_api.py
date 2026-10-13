@@ -61,6 +61,7 @@ WS_TYPE_UPDATE_SMART_CHARGE = "foxess_plant/update_smart_charge"
 WS_TYPE_TARIFF_ENTITY_CANDIDATES = "foxess_plant/tariff_entity_candidates"
 WS_TYPE_UPDATE_SOLCAST = "foxess_plant/update_solcast"
 WS_TYPE_TEST_SOLCAST = "foxess_plant/test_solcast"
+WS_TYPE_UPDATE_OPEN_METEO = "foxess_plant/update_open_meteo"
 WS_TYPE_UPDATE_GLOW = "foxess_plant/update_glow"
 WS_TYPE_TEST_GLOW = "foxess_plant/test_glow"
 WS_TYPE_UPDATE_FOX_CLOUD = "foxess_plant/update_fox_cloud"
@@ -1231,6 +1232,33 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
 
     @websocket_api.websocket_command(
         {
+            vol.Required("type"): WS_TYPE_UPDATE_OPEN_METEO,
+            vol.Optional("plant_id"): str,
+            vol.Required("open_meteo"): vol.Schema(
+                {
+                    vol.Optional("enabled"): cv.boolean,
+                    vol.Optional("primary"): vol.In(["solcast", "open_meteo"]),
+                    vol.Optional("models"): [str],
+                }
+            ),
+        }
+    )
+    @websocket_api.require_admin
+    @websocket_api.async_response
+    async def ws_update_open_meteo(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict[str, Any],
+    ) -> None:
+        coordinator, err_code, err_msg = _get_coordinator(hass, msg.get("plant_id"))
+        if coordinator is None:
+            connection.send_error(msg["id"], err_code, err_msg)
+            return
+        await coordinator.async_save_open_meteo(open_meteo=dict(msg["open_meteo"]))
+        connection.send_result(msg["id"], coordinator.get_plant_state())
+
+    @websocket_api.websocket_command(
+        {
             vol.Required("type"): WS_TYPE_TEST_SOLCAST,
             vol.Optional("plant_id"): str,
         }
@@ -1684,6 +1712,7 @@ def async_register_ws_handlers(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_update_smart_charge)
     websocket_api.async_register_command(hass, ws_update_solcast)
     websocket_api.async_register_command(hass, ws_test_solcast)
+    websocket_api.async_register_command(hass, ws_update_open_meteo)
     websocket_api.async_register_command(hass, ws_update_glow)
     websocket_api.async_register_command(hass, ws_test_glow)
     websocket_api.async_register_command(hass, ws_update_fox_cloud)
