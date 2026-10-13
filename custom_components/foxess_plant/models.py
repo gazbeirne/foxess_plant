@@ -858,6 +858,33 @@ class SolcastConfig:
 
 
 @dataclass
+class OpenMeteoConfig:
+    """Open-Meteo PV forecast (free, no key): backup to Solcast, or the main source.
+
+    ``primary`` picks which provider SmartCharge prefers; the other fills any gap.
+    ``models`` are Open-Meteo weather models, blended by their measured accuracy on this plant.
+    """
+
+    enabled: bool = False
+    primary: str = "solcast"
+    models: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> OpenMeteoConfig:
+        from .open_meteo import DEFAULT_MODELS, MODEL_LABELS
+
+        raw = data if isinstance(data, dict) else {}
+        primary = str(raw.get("primary") or "solcast")
+        if primary not in ("solcast", "open_meteo"):
+            primary = "solcast"
+        models = [m for m in raw.get("models") or [] if m in MODEL_LABELS] or list(DEFAULT_MODELS)
+        return cls(enabled=bool(raw.get("enabled", False)), primary=primary, models=models)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "primary": self.primary, "models": list(self.models)}
+
+
+@dataclass
 class GlowConfig:
     """Hildebrand Glow IHD / Bright API smart-meter settings."""
 
@@ -1406,6 +1433,7 @@ class PlantConfig:
     panel_display: PanelDisplayConfig = field(default_factory=PanelDisplayConfig)
     pv_config: PvSystemConfig = field(default_factory=PvSystemConfig)
     solcast: SolcastConfig = field(default_factory=SolcastConfig)
+    open_meteo: OpenMeteoConfig = field(default_factory=OpenMeteoConfig)
     glow: GlowConfig = field(default_factory=GlowConfig)
     fox_cloud: FoxCloudConfig = field(default_factory=FoxCloudConfig)
     tariff: TariffConfig = field(default_factory=TariffConfig)
@@ -1464,6 +1492,7 @@ class PlantConfig:
             panel_display=PanelDisplayConfig.from_dict(data.get("panel_display", DEFAULT_PANEL_DISPLAY)),
             pv_config=PvSystemConfig.from_dict(data.get("pv_config", DEFAULT_PV_CONFIG)),
             solcast=SolcastConfig.from_dict(data.get("solcast", DEFAULT_SOLCAST)),
+            open_meteo=OpenMeteoConfig.from_dict(data.get("open_meteo")),
             glow=GlowConfig.from_dict(data.get("glow", DEFAULT_GLOW)),
             fox_cloud=FoxCloudConfig.from_dict(data.get("fox_cloud", DEFAULT_FOX_CLOUD)),
             tariff=TariffConfig.from_dict(data.get("tariff", DEFAULT_TARIFF)),
@@ -1488,6 +1517,7 @@ class PlantConfig:
             "panel_display": self.panel_display.to_dict(),
             "pv_config": self.pv_config.to_dict(),
             "solcast": self.solcast.to_dict(),
+            "open_meteo": self.open_meteo.to_dict(),
             "glow": self.glow.to_dict(),
             "fox_cloud": self.fox_cloud.to_dict(include_api_key=True),
             "tariff": self.tariff.to_dict(include_secrets=True),
