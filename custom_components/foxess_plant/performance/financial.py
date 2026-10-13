@@ -54,7 +54,13 @@ def counter_deltas(
     """kWh since the last tick from the daily counters, and the readings to remember.
 
     With no previous reading nothing is counted (we can't price energy from before we were running).
-    A counter that goes down (meter source changed, or reset) is re-read without counting.
+
+    A counter that collapses to ~0 is either a real reset (the counter rolling over just after our own
+    midnight rollover, or a source change) or a dropout: right after an HA restart the Glow-based counters
+    read 0 until the first MQTT message. The level before the collapse is kept (``<key>_before_drop``): if
+    the counter comes straight back to it, that was a dropout and only the change since is counted; if it
+    climbs from 0 instead, it was a reset and counting starts from 0. (Counting the return as new energy
+    re-added the whole day at every restart: 13 Oct 2026 priced ~157 kWh of import for a 7.3 kWh day.)
     """
     deltas: dict[str, float] = {}
     readings: dict[str, float] = dict(last or {})
@@ -65,18 +71,31 @@ def counter_deltas(
         except (TypeError, ValueError):
             deltas[key] = 0.0
             continue
+        drop_key = f"{key}_before_drop"
         prev = (last or {}).get(key)
+        before_drop = (last or {}).get(drop_key)
         if prev is None:
             deltas[key] = 0.0
+        elif before_drop is not None:
+            if value <= 0.05:
+                deltas[key] = 0.0  # still down
+            elif value >= float(before_drop) - 0.05:
+                deltas[key] = value - float(before_drop)  # dropout over: count only what's new
+                readings.pop(drop_key, None)
+            else:
+                deltas[key] = value - float(prev)  # climbing from 0: it really reset
+                readings.pop(drop_key, None)
         else:
             prev_f = float(prev)
-            delta = value - prev_f
-            # Treat ONLY a collapse to ~zero as a reset (midnight rollover / source change) — not a normal
-            # intraday dip. load_consumption = base_load - discharge + charge + grid is a composite that
-            # legitimately swings down a lot when the battery discharges; keeping those negative deltas lets
-            # a day telescope to its true net. A ratio guard (value < prev/2) mis-fired on those swings and
-            # re-inflated priced load → avoided-cost → savings several-fold (true 10.5 kWh counted as ~29).
-            deltas[key] = 0.0 if (prev_f > 0.5 and value <= 0.05) else delta
+            # Treat ONLY a collapse to ~zero as a possible reset — not a normal intraday dip. A counter can
+            # step down when its source switches (e.g. Glow meter vs inverter CT); keeping those negative
+            # deltas lets a day telescope to its true net. A ratio guard (value < prev/2) once mis-fired on such
+            # swings and inflated savings several-fold.
+            if prev_f > 0.5 and value <= 0.05:
+                deltas[key] = 0.0
+                readings[drop_key] = prev_f
+            else:
+                deltas[key] = value - prev_f
         readings[key] = value
     return deltas, readings
 

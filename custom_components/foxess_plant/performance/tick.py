@@ -21,6 +21,9 @@ from .financial import (
 from .sample import collect_performance_sample
 from .store import PerformanceStore
 
+# Bumped when the meaning of the saved counter readings changes (2: house load = inverter load counter)
+COUNTERS_VERSION = 2
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -109,7 +112,11 @@ async def async_performance_tick(coordinator: Any) -> None:
     if sample.solcast_forecast_kwh_today is not None:
         acc["solcast_forecast_kwh_today"] = sample.solcast_forecast_kwh_today
 
-    # Energy since the last tick from the daily kWh counters, priced at the current rates
+    # Energy since the last tick from the daily kWh counters, priced at the current rates.
+    # Readings saved before 0.9.507 hold the old double-counted house load: start them afresh once.
+    if acc.get("counters_version") != COUNTERS_VERSION:
+        acc["counters"] = None
+        acc["counters_version"] = COUNTERS_VERSION
     deltas, acc["counters"] = counter_deltas(acc.get("counters"), coordinator._read_analytics())
     import_kwh, export_kwh, load_kwh = deltas["import"], deltas["export"], deltas["load"]
 
