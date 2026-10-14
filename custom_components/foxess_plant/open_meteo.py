@@ -320,14 +320,19 @@ def update_history(
 ) -> dict[str, list[list[float]]]:
     """Keep each local day's blend for the charts: today and yesterday follow the latest fetch, older days freeze.
 
-    Stored as {day ISO: [[ms, kW], ...]} for the last HISTORY_DAYS days.
+    Stored as {day ISO: [[ms, kW], ...]} for the last HISTORY_DAYS days. Merged hour by hour: the blend only reaches
+    back 24 hours, so replacing yesterday wholesale wiped one more of its morning hours with every hourly fetch.
     """
-    by_day: dict[str, list[list[float]]] = {}
+    by_day: dict[str, dict[float, float]] = {}
     for p in points:
         day = datetime.fromtimestamp(p["t"] / 1000, timezone.utc).astimezone(tz).date()
         if today - timedelta(days=1) <= day <= today:
-            by_day.setdefault(day.isoformat(), []).append([p["t"], round(p["v"], 3)])
-    out = {**history, **by_day}
+            by_day.setdefault(day.isoformat(), {})[p["t"]] = round(p["v"], 3)
+    out = dict(history)
+    for day, fresh in by_day.items():
+        merged = {t: v for t, v in history.get(day) or []}
+        merged.update(fresh)
+        out[day] = [[t, merged[t]] for t in sorted(merged)]
     keep = {(today - timedelta(days=i)).isoformat() for i in range(HISTORY_DAYS)}
     return {d: v for d, v in out.items() if d in keep}
 
@@ -335,14 +340,12 @@ def update_history(
 def points_for_day(
     current: list[dict[str, float]], history: dict[str, list[list[float]]], day: date, tz: tzinfo
 ) -> list[dict[str, float]]:
-    """Chart points for one local day: the current blend where it covers the day, else the stored history."""
+    """Chart points for one local day: the stored history with the current blend laid over the hours it covers."""
     start = datetime.combine(day, datetime.min.time(), tz).timestamp() * 1000
     end = start + 86_400_000
-    live = [p for p in current if start <= p["t"] < end]
-    if len(live) >= 20:
-        return live
-    stored = history.get(day.isoformat()) or []
-    return [{"t": t, "v": v} for t, v in stored] or live
+    merged = {t: v for t, v in history.get(day.isoformat()) or []}
+    merged.update({p["t"]: p["v"] for p in current if start <= p["t"] < end})
+    return [{"t": t, "v": merged[t]} for t in sorted(merged)]
 
 
 def model_day_totals(

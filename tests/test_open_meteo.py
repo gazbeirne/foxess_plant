@@ -136,6 +136,26 @@ def test_history_keeps_past_days_frozen_and_today_live() -> None:
     assert len(om.points_for_day(pts(today, 3.0), new, today, tz)) == 24
 
 
+def test_yesterday_keeps_its_morning_while_the_blend_window_slides() -> None:
+    """The blend only reaches back 24 h: each hourly fetch has one hour less of yesterday. 13 Oct 2026 lost its
+    morning that way (the PV Forecast line started at 09:30 instead of 07:40)."""
+    from datetime import date
+
+    tz = timezone.utc
+    today = date(2026, 10, 14)
+    yesterday = datetime(2026, 10, 13, tzinfo=UTC)
+
+    def window(from_hour: int) -> list[dict]:
+        return [{"t": (yesterday + timedelta(hours=h, minutes=30)).timestamp() * 1000, "v": float(h)} for h in range(from_hour, 24)]
+
+    history: dict = {}
+    for from_hour in (0, 1, 2, 9):  # four hourly fetches, the window moving on
+        history = om.update_history(history, window(from_hour), today=today, tz=tz)
+    assert len(history["2026-10-13"]) == 24 and history["2026-10-13"][0][1] == 0.0
+    # The chart: stored morning plus whatever the live blend still covers
+    assert len(om.points_for_day(window(9), history, yesterday.date(), tz)) == 24
+
+
 def test_daily_kwh_needs_a_whole_day() -> None:
     tz = timezone.utc
     start = datetime(2026, 10, 14, 1, tzinfo=UTC)
