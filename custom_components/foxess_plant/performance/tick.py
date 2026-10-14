@@ -67,6 +67,7 @@ async def async_performance_tick(coordinator: Any) -> None:
     if coordinator._performance_day != local_date:
         if coordinator._performance_day:
             await async_commit_daily_ledger(coordinator, coordinator._performance_day)
+            _repair_panel_temps(coordinator)  # the day the lag started was half unsmoothed
         store: PerformanceStore | None = coordinator._performance_store
         if store is not None:
             try:
@@ -273,6 +274,7 @@ async def async_init_performance_store(coordinator: Any) -> None:
         system_rte=cfg.system_rte,
     )
     await _async_restore_day_state(coordinator, store)
+    _repair_panel_temps(coordinator)
     from .backfill import async_backfill_intraday_from_recorder
 
     try:
@@ -280,6 +282,22 @@ async def async_init_performance_store(coordinator: Any) -> None:
     except Exception:
         # Filling old gaps is a nicety: never let it stop the recorder from starting
         _LOGGER.exception("Performance backfill from the recorder failed")
+
+
+def _repair_panel_temps(coordinator: Any) -> None:
+    """Rebuild panel temperatures of ledger days from before the thermal lag (thermal_repair.py)."""
+    from .thermal_repair import repair_ledger_panel_temps
+
+    store = coordinator._performance_store
+    thermal = getattr(coordinator, "_panel_thermal", None)
+    if store is None or thermal is None:
+        return
+    try:
+        repair_ledger_panel_temps(
+            store, lag_since=getattr(thermal, "since", None), today=dt_util.as_local(dt_util.now()).date()
+        )
+    except Exception:
+        _LOGGER.exception("Panel temperature repair failed")
 
 
 async def _async_restore_day_state(coordinator: Any, store: PerformanceStore) -> None:

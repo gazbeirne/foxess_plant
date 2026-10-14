@@ -471,7 +471,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.519";
+const PANEL_VERSION = "0.9.520";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -3691,10 +3691,12 @@ function performanceChartAxesSvg({ padL, padT, w, h, xDomain, xScale, yScale, yT
   const xTicks = forecastAccuracyXTicks(xDomain.tMin, xDomain.tMax, {
     maxTicks: Math.max(3, Math.min(6, Math.floor(w / 80))),
   });
+  // A label centred on a tick at the plot's edge ran off the chart on a phone ("07:00 PI"): end it at the tick
   const xLabels = xTicks
     .map((xt) => {
       const x = xScale(xt);
-      return `<text x="${x.toFixed(1)}" y="${(plotBottom + 18).toFixed(1)}" text-anchor="middle" class="statistics-axis-x">${esc(formatChartTimeLabel(xt))}</text>`;
+      const anchor = x > padL + w - 30 ? "end" : x < 36 ? "start" : "middle";
+      return `<text x="${x.toFixed(1)}" y="${(plotBottom + 18).toFixed(1)}" text-anchor="${anchor}" class="statistics-axis-x">${esc(formatChartTimeLabel(xt))}</text>`;
     })
     .join("");
   return `${grid}${yLabels}${xLabels}`;
@@ -7607,7 +7609,8 @@ function statisticsChartLayout({ sideLegend = false, hasSoc = false } = {}) {
       ...STATISTICS_CHART_LAYOUT,
       width,
       height: Math.round(Math.min(320, Math.max(240, width * 0.72))),
-      pad: { l: 40, r: hasSoc ? 36 : 8, t: 22, b: 30 },
+      pad: { l: 40, r: hasSoc ? 42 : 8, t: 22, b: 30 }, // "100%" starts 8 px right of the plot and needs ~31 px
+
       xTickHours: 6,
       xTickCount: 4,
     };
