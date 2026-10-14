@@ -153,7 +153,7 @@ def normalize_phone(raw: str) -> str:
     elif digits and not digits.startswith("+"):
         digits = "+" + digits
     if not re.fullmatch(r"\+\d{10,15}", digits):
-        raise FuseParseError("Enter the mobile number on your Fuse account, e.g. 07700 900123")
+        raise FuseParseError("Enter the mobile number on your Fuse account in international format, e.g. +447700900123")
     return digits
 
 

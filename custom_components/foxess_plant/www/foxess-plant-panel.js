@@ -295,7 +295,7 @@ function tariffExportProviderOptions(importProvider) {
 function exportElsewhereHint(exportProvider) {
   const from =
     exportProvider === "entity" ? "a Home Assistant sensor" : TARIFF_SUPPLIERS.includes(exportProvider) ? energyProviderLabel(exportProvider) : "the Export card";
-  return `Export rates come from ${from} (see the Export card below), so they aren't typed into the bands. Changing the Export provider takes effect when you press Save Export.`;
+  return `Export rates come from ${from} (Export card below) and are shown read-only here. To type them in again, choose Manual Rates on the Export card and press Save Export.`;
 }
 
 /** Keep the export choice valid for the import provider (mirrors tariff_export.normalize_export_provider). */
@@ -471,7 +471,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.515";
+const PANEL_VERSION = "0.9.516";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -25405,11 +25405,12 @@ ${standingManualBlock}
     if (!this._tariffDraft) this._initTariffDraft();
     const draft = this._tariffDraft;
     const showImport = normalizeTariffImportSource(draft.import_source) === "schedule";
-    // Export from a sensor or another supplier isn't typed into the bands
-    const showExport =
-      normalizeTariffExportSource(draft.export_source) === "schedule" &&
-      (draft.export_provider === "manual" || draft.export_provider === "same");
-    if (!showImport && !showExport) return "";
+    // Export saved as a sensor or another supplier: shown read-only with that provider's prices (an unsaved Export
+    // choice changes nothing here until Save Export)
+    const savedExportProvider = this._plantState?.tariff?.export_provider || "manual";
+    const exportFrom = savedExportProvider === "manual" || savedExportProvider === "same" ? null : savedExportProvider;
+    const exportByHour = this._plantState?.tariff?.export?.by_hour ?? null;
+    const showExport = true;
     const octopusLocked = octopusNativeManagesSchedule(this._plantState?.tariff, this._octopusDraft);
     const scheduleRatesDisabled = this._busy || octopusLocked;
     const exportManual = supplierExportManual(this._plantState?.tariff, this._octopusDraft, draft.export_provider);
@@ -25441,6 +25442,23 @@ ${standingManualBlock}
           showImport && band.import_p_per_kwh > 0 ? minorToMajor(band.import_p_per_kwh, currency) : "";
         const exportDisplay =
           showExport && band.export_p_per_kwh > 0 ? minorToMajor(band.export_p_per_kwh, currency) : "";
+        let exportCell = "";
+        if (exportFrom) {
+          // Read-only: the saved provider's price for this band's hours ("varies" when they differ)
+          const prices = [
+            ...new Set(
+              schedule.hours
+                .map((b, h) => (b === idx ? exportByHour?.[h] : undefined))
+                .filter((p) => p != null)
+                .map((p) => Number(p).toFixed(4))
+            ),
+          ];
+          const shown = !prices.length ? "—" : prices.length > 1 ? "Varies" : String(minorToMajor(Number(prices[0]), currency));
+          const from = exportFrom === "entity" ? "your export sensor" : energyProviderLabel(exportFrom);
+          exportCell = `<div class="field" style="margin:0"><label>Export ${esc(currency)}/kWh</label><input type="text" readonly disabled data-field="tariff:schedule:band:${idx}:export_from_provider" value="${esc(shown)}" title="${esc(`Set by ${from} — change it on the Export card`)}"></div>`;
+        } else {
+          exportCell = `<div class="field" style="margin:0"><label>Export ${esc(currency)}/kWh</label><input type="number" min="0" max="9999" step="${esc(inputStep)}" inputmode="decimal" data-field="tariff:schedule:band:${idx}:export" value="${esc(String(exportDisplay || ""))}" placeholder="${currency === "GBP" ? "e.g. 0.150" : "e.g. 0.15"}" ${exportRatesDisabled ? "disabled" : ""}></div>`;
+        }
         const bandWorkMode = resolveWorkModeDraft(band.work_mode || "Self Use", workModeOptions);
         const modeOpts = (workModeOptions.length ? workModeOptions : [bandWorkMode])
           .map(
@@ -25451,7 +25469,7 @@ ${standingManualBlock}
         return `<div class="tariff-band-rate-row">
 <span class="tariff-band-chip" style="cursor:default;border:none;padding:4px 0"><span class="tariff-band-swatch" style="background:${TARIFF_BAND_COLORS[idx]}"></span>${esc(TARIFF_BAND_LABELS[idx])}</span>
 ${showImport ? `<div class="field" style="margin:0"><label>Import ${esc(currency)}/kWh</label><input type="number" min="0" max="9999" step="${esc(inputStep)}" inputmode="decimal" data-field="tariff:schedule:band:${idx}:import" value="${esc(String(importDisplay || ""))}" placeholder="${currency === "GBP" ? "e.g. 0.245" : "e.g. 0.25"}" ${scheduleRatesDisabled ? "disabled" : ""}></div>` : `<div></div>`}
-${showExport ? `<div class="field" style="margin:0"><label>Export ${esc(currency)}/kWh</label><input type="number" min="0" max="9999" step="${esc(inputStep)}" inputmode="decimal" data-field="tariff:schedule:band:${idx}:export" value="${esc(String(exportDisplay || ""))}" placeholder="${currency === "GBP" ? "e.g. 0.150" : "e.g. 0.15"}" ${exportRatesDisabled ? "disabled" : ""}></div>` : `<div></div>`}
+${exportCell}
 <label class="tariff-band-work-mode"><span>Work Mode</span><select data-field="tariff:schedule:band:${idx}:work_mode" ${bandInverterDisabled ? "disabled" : ""}>${modeOpts}</select></label>
 <label class="tariff-band-force"><input type="checkbox" data-field="tariff:schedule:band:${idx}:force_charge" ${band.enable_force_charge ? "checked" : ""} ${bandInverterDisabled ? "disabled" : ""}><span>Force Charge</span></label>
 </div>`;
@@ -25478,7 +25496,7 @@ ${showExport ? `<div class="field" style="margin:0"><label>Export ${esc(currency
     return `<div class="card tariff-schedule-card${cardLockClass}">
 <p class="card-title">Daily Time-of-Use Schedule</p>
 <p class="field-hint" style="margin:0 0 12px">${esc(scheduleIntro)}</p>
-${showExport ? "" : `<p class="field-hint" style="margin:0 0 12px">${esc(exportElsewhereHint(draft.export_provider))}</p>`}
+${exportFrom ? `<p class="field-hint" style="margin:0 0 12px">${esc(exportElsewhereHint(exportFrom))}</p>` : ""}
 <div class="toggle-row" style="margin:0 0 12px"><span>Apply band work mode to inverter</span><input type="checkbox" data-field="tariff:apply_band_inverter_control" ${bandControlChecked ? "checked" : ""} ${bandInverterDisabled ? "disabled" : ""}></div>
 <p class="field-hint" style="margin:0 0 12px">${esc(bandControlHint)}</p>
 ${smartChargeBandHint}
@@ -25573,7 +25591,8 @@ ${this._renderTariffExportCard(entities, currency)}`;
       : "";
     return `${intro}
 <div class="field"><label>Mobile Number</label>
-<input type="tel" autocomplete="tel" data-field="fuse:phone" value="${esc(d.phone)}" placeholder="07700 900123" ${busy}>
+<input type="tel" autocomplete="tel" data-field="fuse:phone" value="${esc(d.phone)}" placeholder="+447700900123" ${busy}>
+<p class="field-hint">In international (E.164) format: +44 then the number without its leading 0, e.g. +447700900123.</p>
 </div>
 ${codeStep}
 <div class="btn-row">

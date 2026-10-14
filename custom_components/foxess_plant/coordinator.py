@@ -5947,7 +5947,13 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "last_error": fuse.get("last_error"),
             }
         rows = self._export_override_rows() or []
+        by_hour: list[float | None] | None = None
+        if rows:
+            # Today's export price per local hour, for the read-only Export column in the schedule editor
+            local_midnight = dt_util.as_local(dt_util.utcnow()).replace(hour=0, minute=0, second=0, microsecond=0)
+            by_hour = [rate_at(local_midnight + timedelta(hours=h, minutes=30), rows) for h in range(24)]
         return {
+            "by_hour": by_hour,
             "provider": tariff.export_provider,
             "label": export_label(tariff),
             "supplier": tariff.export_supplier.to_dict(include_api_key=False),
