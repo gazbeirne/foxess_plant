@@ -238,6 +238,54 @@ async def async_setup_entry(
             )
         )
     async_add_entities(entities)
+    # Sensors that only exist once their feature is used (the Fuse meter status) are added later through this
+    coordinator._add_sensor_entities = async_add_entities
+    coordinator._ensure_fuse_meter_sensor()
+
+
+class FoxessPlantFuseMeterSensor(CoordinatorEntity[FoxessPlantCoordinator], SensorEntity):
+    """When Fuse's real meter readings reach up to (they go into long-term statistics, fuse_meter.py)."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:meter-electric"
+
+    def __init__(self, coordinator: FoxessPlantCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_device_info = plant_device_info(entry)
+        self._attr_unique_id = f"{entry.entry_id}_fuse_meter_data_up_to"
+        self._attr_name = f"{entry.title} Fuse meter data up to"
+
+    def _meter(self) -> dict[str, Any]:
+        return self.coordinator._fuse_meter_status()
+
+    def _directions(self) -> dict[str, dict[str, Any]]:
+        meter = self._meter()
+        return {k: v for k, v in meter.items() if isinstance(v, dict)}
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator._fuse_in_use() and self.native_value is not None
+
+    @property
+    def native_value(self) -> datetime | None:
+        times = [dt_util.parse_datetime(str(v.get("data_up_to"))) for v in self._directions().values() if v.get("data_up_to")]
+        times = [t for t in times if t is not None]
+        return max(times) if times else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        meter = self._meter()
+        attrs: dict[str, Any] = {"last_fetch_at": meter.get("last_fetch_at"), "last_error": meter.get("last_error")}
+        for kind, info in self._directions().items():
+            prefix = {"ELEC_IMPORT": "import", "ELEC_EXPORT": "export", "GAS": "gas"}.get(kind, kind.lower())
+            attrs[f"{prefix}_statistic_id"] = info.get("statistic_id")
+            attrs[f"{prefix}_data_up_to"] = info.get("data_up_to")
+            # gas may be in m³ (the unit attribute says which)
+            attrs[f"{prefix}_yesterday" if kind == "GAS" else f"{prefix}_yesterday_kwh"] = info.get("yesterday_kwh")
+            if kind == "GAS":
+                attrs["gas_unit"] = info.get("unit")
+        return attrs
 
 
 class FoxessPlantModeSensor(CoordinatorEntity[FoxessPlantCoordinator], SensorEntity):
