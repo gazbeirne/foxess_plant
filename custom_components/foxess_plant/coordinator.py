@@ -6057,6 +6057,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if isinstance(data, dict):
             self._fuse_state = data
             self._fuse_apply()
+            # Fuse export loads after the import supplier's cache was built: lay its rows over it now, not an hour later
+            self._apply_manual_export_to_cache()
+            self._sync_octopus_current_rates_from_cache()
 
     async def _async_save_fuse(self) -> None:
         # Saved straight away: the sign-in cookie must survive a restart (persist state, not memory)
