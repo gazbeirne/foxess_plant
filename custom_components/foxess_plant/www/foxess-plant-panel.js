@@ -471,7 +471,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.517";
+const PANEL_VERSION = "0.9.518";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -25630,6 +25630,20 @@ ${live.code_sent ? `<button type="button" class="btn btn-primary" data-action="f
     return lines;
   }
 
+  /** Real meter readings imported into Home Assistant statistics for one direction (fuse_meter.py). */
+  _fuseMeterLines(kind) {
+    const meter = this._plantState?.tariff?.fuse?.meter ?? {};
+    const info = meter[kind];
+    if (!info) return meter.last_error ? [`Meter readings: ${meter.last_error}`] : [];
+    const upTo = info.data_up_to ? formatSolcastTimestamp(info.data_up_to) : "none yet";
+    const lines = [`Meter readings: real readings up to ${upTo}, in Home Assistant statistics as "${info.name}" (Energy dashboard)`];
+    if (info.yesterday_kwh != null) {
+      lines.push(`Yesterday from the meter: ${Number(info.yesterday_kwh).toFixed(2)} kWh ${kind === "ELEC_EXPORT" ? "exported" : "imported"}`);
+    }
+    if (meter.last_error) lines.push(`Meter readings: ${meter.last_error}`);
+    return lines;
+  }
+
   _fuseFetchLines(live) {
     const lines = [];
     if (live.last_fetch_at) lines.push(`Last read from Fuse: ${formatSolcastTimestamp(live.last_fetch_at)}`);
@@ -25646,10 +25660,14 @@ ${live.code_sent ? `<button type="button" class="btn btn-primary" data-action="f
     const busy = this._busy ? "disabled" : "";
     const saved = dyn.provider === "fuse" && dyn.enabled;
     const lines = [...this._fuseTariffLines("ELEC_IMPORT", currency)];
+    if (saved) lines.push(...this._fuseMeterLines("ELEC_IMPORT"));
     if (live.last_fetch_at && !live.tariffs?.ELEC_IMPORT && !live.last_error) {
       lines.push("No import supply on this Fuse account");
     }
-    if (this._tariffDraft?.export_provider === "same") lines.push(...this._fuseTariffLines("ELEC_EXPORT", currency));
+    if (this._tariffDraft?.export_provider === "same") {
+      lines.push(...this._fuseTariffLines("ELEC_EXPORT", currency));
+      if (saved) lines.push(...this._fuseMeterLines("ELEC_EXPORT"));
+    }
     lines.push(...this._fuseFetchLines(live));
     if (!saved) lines.push("Not saved yet — press Save Fuse to use Fuse for import.");
     return `<div class="card">
@@ -25733,6 +25751,7 @@ ${provider === "entity" ? this._renderTariffEntityField("import", entities.impor
     if (fuse) {
       const fuseLive = this._plantState?.tariff?.fuse ?? {};
       statusLines.push(...this._fuseTariffLines("ELEC_EXPORT", currency));
+      if (savedProvider === "fuse") statusLines.push(...this._fuseMeterLines("ELEC_EXPORT"));
       if (fuseLive.last_fetch_at && !fuseLive.tariffs?.ELEC_EXPORT && !fuseLive.last_error) {
         statusLines.push("No export supply on this Fuse account");
       }

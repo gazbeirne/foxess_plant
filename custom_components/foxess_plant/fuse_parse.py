@@ -53,6 +53,7 @@ class FuseTariff:
     standing_p_per_day: float = 0.0
     tariff_id: str | None = None
     identifier: str | None = None  # MPAN
+    premises_id: str | None = None  # for the meter-readings pages (fuse_meter.py)
     start_date: str | None = None  # YYYY-MM-DD (UK)
     end_date: str | None = None
     fixed: bool = False

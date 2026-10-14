@@ -187,6 +187,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._fuse_store: Any = None
         self._fuse_session: Any = None
         self._fuse_lock = asyncio.Lock()
+        # Fuse meter readings into long-term statistics (fuse_meter.py); the status sensor is added once Fuse is used
+        self._unsub_fuse_meter: Any = None
+        self._fuse_meter_lock = asyncio.Lock()
+        self._fuse_meter_sensor: Any = None
+        self._add_sensor_entities: Any = None
         self._octopus_greener_store = None
         self._octopus_greener_cache: dict[str, Any] = {}
         self._octopus_greener_history_count = 0
@@ -1287,7 +1292,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._setup_octopus_timer()
         self._setup_octopus_greener_timer()
         self._setup_octopus_consumption_timer()
-        self._setup_export_supplier_timer()
+        self._setup_export_supplier_timer()  # also starts the Fuse meter readings timer
         self._setup_glow_mqtt()
         self._setup_smart_charge_timer()
         self._setup_smart_charge_daily_plan_timer()
@@ -5853,6 +5858,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._export_supplier_store_handle().async_delay_save(lambda: cache, 2)
 
     def _setup_export_supplier_timer(self) -> None:
+        self._setup_fuse_meter_timer()  # every tariff save comes through here; Fuse meter readings follow it
         if self._unsub_export_supplier:
             self._unsub_export_supplier()
             self._unsub_export_supplier = None
@@ -6156,6 +6162,8 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._async_save_fuse()
         self._fuse_signin_notice(None)
         await self._async_refresh_fuse(force=True)
+        self._setup_fuse_meter_timer()
+        self.hass.async_create_task(self._async_refresh_fuse_meter(force=True))
         await self.async_request_refresh()
         return self._fuse_status()
 
@@ -6250,6 +6258,129 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._apply_manual_export_to_cache()
         self._sync_octopus_current_rates_from_cache()
 
+    # --- Fuse meter readings -> long-term statistics (fuse_meter.py) --------------------------------------------
+
+    def _fuse_meter_targets(self) -> list[dict[str, Any]]:
+        """Saved Fuse tariffs for the directions Fuse prices (import, export, or export under "same")."""
+        from .fuse_parse import SUPPLY_EXPORT, SUPPLY_IMPORT
+
+        tariff = self.plant.tariff
+        tariffs = self._fuse_state.get("tariffs") or {}
+        kinds = []
+        if tariff.dynamic.native_fuse():
+            kinds.append(SUPPLY_IMPORT)
+        if tariff.export_provider == "fuse" or (tariff.export_provider == "same" and tariff.dynamic.native_fuse()):
+            kinds.append(SUPPLY_EXPORT)
+        return [tariffs[k] for k in kinds if tariffs.get(k)]
+
+    def _setup_fuse_meter_timer(self) -> None:
+        if self._unsub_fuse_meter:
+            self._unsub_fuse_meter()
+            self._unsub_fuse_meter = None
+        if not self._fuse_in_use():
+            return
+        self._ensure_fuse_meter_sensor()
+        # Hourly check; it only fetches when the saved times say a fetch is due (every 6 h, an hour after a failure)
+        self._unsub_fuse_meter = async_track_time_interval(
+            self.hass, self._fuse_meter_timer_callback, timedelta(hours=1)
+        )
+        self.hass.async_create_task(self._async_refresh_fuse_meter())
+
+    @callback
+    def _fuse_meter_timer_callback(self, _now) -> None:
+        self.hass.async_create_task(self._async_refresh_fuse_meter())
+
+    def _ensure_fuse_meter_sensor(self) -> None:
+        """Add the "Fuse meter data up to" sensor the first time Fuse is in use (no Fuse, no sensor)."""
+        if self._fuse_meter_sensor is not None or self._add_sensor_entities is None or not self._fuse_in_use():
+            return
+        from .sensor import FoxessPlantFuseMeterSensor
+
+        self._fuse_meter_sensor = FoxessPlantFuseMeterSensor(self, self.config_entry)
+        self._add_sensor_entities([self._fuse_meter_sensor])
+
+    async def _async_refresh_fuse_meter(self, *, force: bool = False) -> None:
+        """Read Fuse's half-hourly meter readings and append confirmed hours to the statistics (one run at a time)."""
+        async with self._fuse_meter_lock:
+            await self._async_refresh_fuse_meter_locked(force=force)
+
+    async def _async_refresh_fuse_meter_locked(self, *, force: bool) -> None:
+        import asyncio as _asyncio
+
+        from homeassistant.util import dt as dt_util
+
+        from . import fuse_meter
+        from .fuse_api import FuseApiError, FuseAuthRequired
+        from .fuse_parse import UK_TZ, FuseParseError, parse_iso
+
+        if "recorder" not in self.hass.config.components or not self._fuse_in_use():
+            return
+        state = self._fuse_state
+        if not (state.get("cookies") or {}).get("app-auth") or state.get("auth_failed"):
+            return
+        meter = state.setdefault("meter", {})
+        now = dt_util.utcnow()
+        if not force:
+            last_attempt = parse_iso(meter.get("last_attempt_at"))
+            wait = fuse_meter.RETRY_AFTER if meter.get("last_error") else fuse_meter.FETCH_EVERY
+            if last_attempt is not None and now - last_attempt < wait:
+                return
+        targets = self._fuse_meter_targets()
+        if targets and not all(t.get("premises_id") for t in targets):
+            await self._async_refresh_fuse(force=True)  # tariffs saved before 0.9.518 lack the property id
+            targets = self._fuse_meter_targets()
+        if not targets:
+            return
+        today = now.astimezone(UK_TZ).date()
+        meter["last_attempt_at"] = now.isoformat()
+        meter["last_error"] = None
+        client = self._fuse_client()
+        try:
+            for tariff in targets:
+                kind = tariff["supply_type"]
+                stat_id = fuse_meter.statistic_id(self.config_entry.entry_id, kind)
+                last_hour, last_sum = await fuse_meter.async_last_statistic(self.hass, stat_id)
+                slots: list[dict[str, Any]] = []
+                months = fuse_meter.months_to_fetch(today, last_hour)
+                for i, (year, month) in enumerate(months):
+                    if i:
+                        await _asyncio.sleep(2)  # back-fill pages one after another, gently
+                    page = await client.hh_readings_page(tariff["premises_id"], tariff["supply_fid"], year=year, month=month)
+                    try:
+                        slots += fuse_meter.parse_hh_page(page)
+                    except FuseParseError:
+                        if (year, month) == (today.year, today.month):
+                            raise
+                        _LOGGER.debug("Fuse %s meter page %s-%02d has no readings (before the supply started?)", kind, year, month)
+                hours = fuse_meter.hours_to_write(slots, after=last_hour, now=now)
+                if hours:
+                    fuse_meter.async_write_statistics(
+                        self.hass, kind, stat_id, fuse_meter.statistics_rows(hours, start_sum=last_sum)
+                    )
+                up_to = fuse_meter.data_up_to(slots)
+                yesterday = today - timedelta(days=1)
+                info = meter.setdefault(kind, {})
+                info.update(
+                    statistic_id=stat_id,
+                    data_up_to=up_to.isoformat() if up_to else info.get("data_up_to"),
+                    last_hour=(hours[-1][0] if hours else last_hour).isoformat() if (hours or last_hour) else None,
+                    hours_written=len(hours),
+                    yesterday=yesterday.isoformat(),
+                    yesterday_kwh=fuse_meter.day_total(slots, yesterday),
+                )
+                _LOGGER.debug("Fuse %s meter: %s new hours, data up to %s", kind, len(hours), up_to)
+            meter["last_fetch_at"] = now.isoformat()
+        except FuseAuthRequired as err:
+            state.update(auth_failed=True, last_error=str(err))
+            meter["last_error"] = str(err)
+            self._fuse_signin_notice(str(err))
+        except (FuseApiError, FuseParseError) as err:
+            meter["last_error"] = str(err)
+            _LOGGER.warning("Fuse meter readings failed: %s", err)
+        await self._async_save_fuse()
+        if self._fuse_meter_sensor is not None:
+            self._fuse_meter_sensor.async_write_ha_state()
+
     def _fuse_signin_notice(self, message: str | None) -> None:
         """A Home Assistant notification when Fuse ends the session (removed once signed in again)."""
         from homeassistant.components import persistent_notification
@@ -6319,7 +6450,20 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "auth_failed": bool(state.get("auth_failed")),
             "in_use": self._fuse_in_use(),
             "tariffs": tariffs,
+            "meter": self._fuse_meter_status(),
         }
+
+    def _fuse_meter_status(self) -> dict[str, Any]:
+        """What the meter readings import has done, per direction (Tariff page and the status sensor)."""
+        from .fuse_meter import statistic_name
+
+        meter = self._fuse_state.get("meter") or {}
+        out: dict[str, Any] = {"last_fetch_at": meter.get("last_fetch_at"), "last_error": meter.get("last_error")}
+        for kind in ("ELEC_IMPORT", "ELEC_EXPORT"):
+            info = meter.get(kind)
+            if info:
+                out[kind] = {**info, "name": statistic_name(kind)}
+        return out
 
     async def _async_sync_octopus_standing_charge(self) -> bool:
         """Persist Octopus standing charge into plugin tariff when it changes.
@@ -6740,6 +6884,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if getattr(self, "_unsub_export_supplier", None):
             self._unsub_export_supplier()
             self._unsub_export_supplier = None
+        if getattr(self, "_unsub_fuse_meter", None):
+            self._unsub_fuse_meter()
+            self._unsub_fuse_meter = None
         if self._unsub_triggers:
             self._unsub_triggers()
             self._unsub_triggers = None

@@ -206,6 +206,15 @@ class FuseWebClient:
         )
         return text
 
+    async def hh_readings_page(self, premises_id: str, supply_fid: str, *, year: int, month: int) -> str:
+        """The meter's half-hourly readings for a month (fuse_meter.py)."""
+        _status, text = await self._request(
+            "GET",
+            f"/app/premises/{premises_id}/supply/{supply_fid}/meter/hh-readings?month={month}&year={year}",
+            headers={"RSC": "1", "Accept": "text/x-component"},
+        )
+        return text
+
     async def tariff_page(self, premises_id: str, supply_fid: str) -> str:
         _status, text = await self._request(
             "GET",
@@ -303,6 +312,7 @@ async def fetch_fuse_tariffs(client: FuseWebClient, *, today: date) -> dict[str,
             )
         tariff.supply_type = sup["supply_type"]
         tariff.identifier = sup.get("identifier")
+        tariff.premises_id = sup["premises_id"]
         out[sup["supply_type"]] = apply_contract(tariff, contract).to_dict()
     if not out:
         raise FuseApiError("Fuse isn't supplying electricity on this account yet")
