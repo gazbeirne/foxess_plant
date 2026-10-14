@@ -2,7 +2,7 @@
 
 Central **plant controller** for FoxESS inverters running [foxess_modbus](https://github.com/nathanmarlor/foxess_modbus). Owns charge-period policy, work mode / SOC limits, drift detection, tariff-aware automation, and a full **Fox Plant** sidebar panel — **does not** talk Modbus itself.
 
-Current release: **v0.9.503**
+Current release: **v0.9.521**
 
 ## Screenshots
 
@@ -37,6 +37,7 @@ Current release: **v0.9.503**
 | **Solcast** (hobbyist API key in Fox Plant) | PV forecast charts, SmartCharge solar budget, optional StormSafe PV pre-check |
 | **Octopus Energy** (API key in Fox Plant) | Agile / Tracker / Go / Economy 7 / flat tariffs, export/SEG rates, Greener Nights |
 | **E.ON Next** (browser sign-in token in Fox Plant) | Fixed / flexible / Economy 7 / Next Drive tariffs, export rates, standing charge |
+| **Fuse Energy** (phone number + texted code in Fox Plant) | Import and/or export tariff, contract dates; real half-hourly meter readings (electricity and gas) into the Energy dashboard |
 | **Glow / Hildebrand IHD** (MQTT and/or Bright API) | Live grid import for analysis; optional SmartCharge meter rate verify |
 | **Fox Cloud Open API** | Battery Warmup changes (the inverter refuses warm-up writes over Modbus) |
 | Local weather / PWS (e.g. Ecowitt) | Performance wind, rain, dew point, and related charts |
@@ -113,8 +114,20 @@ Cost-optimised grid charging and export using your **tariff**, the **Solcast** P
 - Import and export rates, including an export meter held on a separate E.ON account on the same login
 - A good fetch syncs the daily schedule and standing charge and is saved. For fixed and time-of-use tariffs Fox Plant then stops contacting E.ON until the agreement end date, rolling the saved daily rates forward (restarts included). Paste a fresh token and save again if your tariff changes; open-ended or ended agreements keep fetching hourly
 - Octopus-only extras (Greener Nights, Octopus Energy Analysis) are not available
-- **Mixed suppliers**: set *Export rates from* to Manual when export is with someone else (e.g. E.ON Next import + Fused fixed SEG). Import stays live from the API; type export per band in the daily schedule. Also works with Octopus, and switches to manual automatically when the supplier has no export rates
 - Configure under **Settings → Tariff** (provider E.ON Next)
+
+### Fuse Energy
+
+- Fuse has no API keys, so Fox Plant signs in the way the Fuse website does: **Settings → Tariff**, choose **Fuse** as the Import and/or Export provider, enter your mobile number in international format (e.g. `+447700900123`), press **Send Code**, type in the code Fuse texts you and press **Sign In**. Then **Save Fuse** (import) or **Save Export**. One sign-in serves import and export, and survives restarts
+- Reads the current tariff: unit rate(s), the hours each rate applies, standing charge, contract dates and the next price change. Re-read weekly, daily after a contract ends, and on **Fetch Rates Now**; rates are rebuilt from the saved tariff in between, so SmartCharge never runs short of prices
+- **Meter readings**: Fuse's real half-hourly smart-meter readings (estimates are never used) go into Home Assistant long-term statistics as **Fuse Grid Import**, **Fuse Grid Export** and **Fuse Gas**, every 6 hours, with 3 months back-filled. Pick them in **Settings → Dashboards → Energy**. They're statistics, not entities: see them in Developer Tools → Statistics. The diagnostic sensor *Fuse meter data up to* shows how far the readings reach
+- If Fuse ends the session, Home Assistant shows a notification; the saved rates stay in use until you sign in again
+- Not yet seen on a real account: multi-rate (Day/Night) rate hours and the gas readings' unit. Reports welcome
+- Developers: what we learned about Fuse's web app is in [docs/FUSE_ENERGY_API.md](docs/FUSE_ENERGY_API.md)
+
+### Mixed suppliers
+
+Import and export each have their own provider on **Settings → Tariff**: the same supplier for both, or e.g. E.ON Next import with Octopus Outgoing or Fuse export, a Home Assistant sensor, or rates you type into the daily schedule (Manual Rates, e.g. a fixed SEG). With export priced elsewhere, the schedule's Export column shows that provider's prices read-only.
 
 ### Solcast PV forecast
 
@@ -180,6 +193,7 @@ Outage and Forecast prep remain available via the integration options / backend 
 | [docs/STORMSAFE_GOOGLE_WEATHER.md](docs/STORMSAFE_GOOGLE_WEATHER.md) | StormSafe + Google Weather |
 | [docs/NODE_RED.md](docs/NODE_RED.md) | Services, plant state, Node-RED |
 | [docs/PANEL.md](docs/PANEL.md) | Panel notes (may lag the live UI — prefer this README + the sidebar) |
+| [docs/FUSE_ENERGY_API.md](docs/FUSE_ENERGY_API.md) | Unofficial notes on Fuse Energy's web app: sign-in, tariffs, half-hourly meter readings (for other integrations) |
 
 ## License
 
