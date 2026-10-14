@@ -291,6 +291,13 @@ function tariffExportProviderOptions(importProvider) {
   return opts;
 }
 
+/** Why the schedule has no Export column: export is priced on the Export card instead. */
+function exportElsewhereHint(exportProvider) {
+  const from =
+    exportProvider === "entity" ? "a Home Assistant sensor" : TARIFF_SUPPLIERS.includes(exportProvider) ? energyProviderLabel(exportProvider) : "the Export card";
+  return `Export rates come from ${from} (see the Export card below), so they aren't typed into the bands. Changing the Export provider takes effect when you press Save Export.`;
+}
+
 /** Keep the export choice valid for the import provider (mirrors tariff_export.normalize_export_provider). */
 function normalizeTariffExportProvider(value, importProvider, exportSource) {
   const supplier = TARIFF_SUPPLIERS.includes(importProvider) ? importProvider : "";
@@ -464,7 +471,7 @@ const FOX_FLOW_PATHS = {
 const FOX_FLOW_HUB_SPOKES = new Set(["solar-aio", "aio-hub", "hub-aio", "hub-home", "grid-hub", "hub-grid"]);
 
 const FLOW_PATHS_VER = "flow-comet-v3";
-const PANEL_VERSION = "0.9.514";
+const PANEL_VERSION = "0.9.515";
 /** Bump when Device Analysis DOM/CSS layout changes (forces full re-render). */
 const DEVICE_NEW_ANALYSIS_LAYOUT_VER = "11";
 /** Extra .main max-width on Device view ≈ sidebar column (280px) + layout gap (16px). */
@@ -25471,6 +25478,7 @@ ${showExport ? `<div class="field" style="margin:0"><label>Export ${esc(currency
     return `<div class="card tariff-schedule-card${cardLockClass}">
 <p class="card-title">Daily Time-of-Use Schedule</p>
 <p class="field-hint" style="margin:0 0 12px">${esc(scheduleIntro)}</p>
+${showExport ? "" : `<p class="field-hint" style="margin:0 0 12px">${esc(exportElsewhereHint(draft.export_provider))}</p>`}
 <div class="toggle-row" style="margin:0 0 12px"><span>Apply band work mode to inverter</span><input type="checkbox" data-field="tariff:apply_band_inverter_control" ${bandControlChecked ? "checked" : ""} ${bandInverterDisabled ? "disabled" : ""}></div>
 <p class="field-hint" style="margin:0 0 12px">${esc(bandControlHint)}</p>
 ${smartChargeBandHint}
