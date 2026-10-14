@@ -6201,8 +6201,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         fetched = False
         async with self._fuse_lock:
             state["last_attempt_at"] = now.isoformat()
+            supplies: list[dict[str, Any]] = []
             try:
-                tariffs = await fetch_fuse_tariffs(self._fuse_client(), today=today)
+                tariffs = await fetch_fuse_tariffs(self._fuse_client(), today=today, supplies_out=supplies)
             except FuseAuthRequired as err:
                 state.update(auth_failed=True, last_error=str(err))
                 self._fuse_signin_notice(str(err))
@@ -6214,6 +6215,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 missing = [k.split("_")[-1].lower() for k in needed if k not in tariffs]
                 state.update(
                     tariffs=tariffs,
+                    supplies=supplies,  # every supply Fuse supplies, gas included (meter readings)
                     last_fetch_at=now.isoformat(),
                     auth_failed=False,
                     # A missing supply waits like a failure, so it isn't asked for on every tick
@@ -6261,8 +6263,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # --- Fuse meter readings -> long-term statistics (fuse_meter.py) --------------------------------------------
 
     def _fuse_meter_targets(self) -> list[dict[str, Any]]:
-        """Saved Fuse tariffs for the directions Fuse prices (import, export, or export under "same")."""
-        from .fuse_parse import SUPPLY_EXPORT, SUPPLY_IMPORT
+        """Supplies to read: electricity in the directions Fuse prices (import, export, or export under "same"),
+        and Fuse gas, so a Fuse customer needs no second integration for their gas meter."""
+        from .fuse_parse import SUPPLY_EXPORT, SUPPLY_GAS, SUPPLY_IMPORT
 
         tariff = self.plant.tariff
         tariffs = self._fuse_state.get("tariffs") or {}
@@ -6271,7 +6274,11 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             kinds.append(SUPPLY_IMPORT)
         if tariff.export_provider == "fuse" or (tariff.export_provider == "same" and tariff.dynamic.native_fuse()):
             kinds.append(SUPPLY_EXPORT)
-        return [tariffs[k] for k in kinds if tariffs.get(k)]
+        targets = [tariffs[k] for k in kinds if tariffs.get(k)]
+        gas = next((s for s in self._fuse_state.get("supplies") or [] if s.get("supply_type") == SUPPLY_GAS), None)
+        if gas and self._fuse_in_use():
+            targets.append(gas)
+        return targets
 
     def _setup_fuse_meter_timer(self) -> None:
         if self._unsub_fuse_meter:
@@ -6326,8 +6333,9 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if last_attempt is not None and now - last_attempt < wait:
                 return
         targets = self._fuse_meter_targets()
-        if targets and not all(t.get("premises_id") for t in targets):
-            await self._async_refresh_fuse(force=True)  # tariffs saved before 0.9.518 lack the property id
+        if (targets and not all(t.get("premises_id") for t in targets)) or "supplies" not in state:
+            # Saved before 0.9.518 (no property id) / 0.9.519 (no supply list, so no gas): read the account again
+            await self._async_refresh_fuse(force=True)
             targets = self._fuse_meter_targets()
         if not targets:
             return
@@ -6353,14 +6361,17 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             raise
                         _LOGGER.debug("Fuse %s meter page %s-%02d has no readings (before the supply started?)", kind, year, month)
                 hours = fuse_meter.hours_to_write(slots, after=last_hour, now=now)
+                info = meter.setdefault(kind, {})
+                # The unit is fixed once a statistic exists (kWh; a gas meter may report m³)
+                unit = info.get("unit") if last_hour is not None and info.get("unit") else fuse_meter.reading_unit(slots)
                 if hours:
                     fuse_meter.async_write_statistics(
-                        self.hass, kind, stat_id, fuse_meter.statistics_rows(hours, start_sum=last_sum)
+                        self.hass, kind, stat_id, fuse_meter.statistics_rows(hours, start_sum=last_sum), unit=unit
                     )
                 up_to = fuse_meter.data_up_to(slots)
                 yesterday = today - timedelta(days=1)
-                info = meter.setdefault(kind, {})
                 info.update(
+                    unit=unit,
                     statistic_id=stat_id,
                     data_up_to=up_to.isoformat() if up_to else info.get("data_up_to"),
                     last_hour=(hours[-1][0] if hours else last_hour).isoformat() if (hours or last_hour) else None,
@@ -6459,7 +6470,7 @@ class FoxessPlantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         meter = self._fuse_state.get("meter") or {}
         out: dict[str, Any] = {"last_fetch_at": meter.get("last_fetch_at"), "last_error": meter.get("last_error")}
-        for kind in ("ELEC_IMPORT", "ELEC_EXPORT"):
+        for kind in ("ELEC_IMPORT", "ELEC_EXPORT", "GAS"):
             info = meter.get(kind)
             if info:
                 out[kind] = {**info, "name": statistic_name(kind)}

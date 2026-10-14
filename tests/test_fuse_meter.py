@@ -15,7 +15,7 @@ import pytest
 
 from custom_components.foxess_plant import fuse_meter
 from custom_components.foxess_plant.coordinator import FoxessPlantCoordinator
-from custom_components.foxess_plant.fuse_parse import SUPPLY_EXPORT, UK_TZ
+from custom_components.foxess_plant.fuse_parse import SUPPLY_EXPORT, SUPPLY_GAS, UK_TZ
 
 PREMISES = "11111111-1111-4111-8111-111111111111"
 EXPORT_FID = "22222222-2222-4222-8222-222222222222"
@@ -136,6 +136,46 @@ def test_statistic_ids_are_valid() -> None:
 
     sid = fuse_meter.statistic_id("01JABCDEF0123456789XYZ", SUPPLY_EXPORT)
     assert valid_statistic_id(sid) and fuse_meter.statistic_name(SUPPLY_EXPORT) == "Fuse Grid Export"
+    gas = fuse_meter.statistic_id("01JABCDEF0123456789XYZ", SUPPLY_GAS)
+    assert valid_statistic_id(gas) and gas.startswith("foxess_plant:fuse_gas_") and fuse_meter.statistic_name(SUPPLY_GAS) == "Fuse Gas"
+
+
+def test_unit_comes_from_the_readings() -> None:
+    day = _day(date(2026, 10, 13), 0.1)
+    assert fuse_meter.reading_unit(fuse_meter.parse_hh_page(_page({"2026-10-13": day}))) == "kWh"
+    for slot in day:
+        slot["reading"]["unit"] = "m3"
+    assert fuse_meter.reading_unit(fuse_meter.parse_hh_page(_page({"2026-10-13": day}))) == "m³"
+    assert fuse_meter.reading_unit([]) == "kWh"
+
+
+def test_only_supplies_fuse_actually_supplies_are_read() -> None:
+    """Supplies being onboarded or cancelled (another supplier still supplies them) are left alone."""
+    from custom_components.foxess_plant.fuse_parse import account_supplies, contracted_supplies
+
+    premises = [
+        {
+            "premises": {"id": PREMISES},
+            "supplies": [
+                {"supply_fid": EXPORT_FID, "supply_definition": {"supply_type": "ELEC_EXPORT"}},
+                {"supply_fid": "import-onboarding", "supply_definition": {"supply_type": "ELEC_IMPORT"}},
+                {"supply_fid": "gas-cancelled", "supply_definition": {"supply_type": "GAS"}},
+                {"supply_fid": "gas-live", "supply_definition": {"supply_type": "GAS"}},
+            ],
+        }
+    ]
+    contracts = {
+        "contracts": {
+            "supply_fid_to_contracts": {
+                EXPORT_FID: {"current": {"from_date_uk": "2026-10-01"}},
+                "import-onboarding": {"current": None},
+                "gas-cancelled": {"current": None},
+                "gas-live": {"current": {"from_date_uk": "2026-01-01"}},
+            }
+        }
+    }
+    live = contracted_supplies(contracts)
+    assert [s["supply_fid"] for s in account_supplies(premises) if s["supply_fid"] in live] == [EXPORT_FID, "gas-live"]
 
 
 # --- The coordinator run (fake web client and recorder) ---------------------------------------------------------
@@ -158,6 +198,7 @@ class _Fake:
         self._fuse_state = {
             "cookies": {"app-auth": "a"},
             "tariffs": {SUPPLY_EXPORT: {"supply_type": SUPPLY_EXPORT, "supply_fid": EXPORT_FID, "premises_id": PREMISES}},
+            "supplies": [],
         }
         self._fuse_meter_sensor = None
         self._client = client
@@ -194,7 +235,7 @@ async def test_run_writes_new_confirmed_hours_and_remembers_the_state() -> None:
 
     with (
         patch.object(fuse_meter, "async_last_statistic", last),
-        patch.object(fuse_meter, "async_write_statistics", lambda h, k, sid, rows: written.append((k, sid, rows))),
+        patch.object(fuse_meter, "async_write_statistics", lambda h, k, sid, rows, unit: written.append((k, sid, rows))),
         patch("homeassistant.util.dt.utcnow", return_value=now),
     ):
         await FoxessPlantCoordinator._async_refresh_fuse_meter_locked(fake, force=True)
@@ -224,13 +265,29 @@ async def test_first_run_back_fills_three_months_and_tolerates_months_before_the
 
     with (
         patch.object(fuse_meter, "async_last_statistic", last),
-        patch.object(fuse_meter, "async_write_statistics", lambda h, k, sid, rows: written.append(rows)),
+        patch.object(fuse_meter, "async_write_statistics", lambda h, k, sid, rows, unit: written.append(rows)),
         patch("homeassistant.util.dt.utcnow", return_value=now),
         patch("asyncio.sleep", return_value=None),
     ):
         await FoxessPlantCoordinator._async_refresh_fuse_meter_locked(fake, force=True)
     assert client.asked == [(2026, 7), (2026, 8), (2026, 9), (2026, 10)]
     assert len(written[0]) == 24 and written[0][-1]["sum"] == pytest.approx(4.8)
+
+
+def test_gas_is_read_whenever_fuse_is_in_use() -> None:
+    from custom_components.foxess_plant.models import TariffConfig
+
+    gas = {"supply_type": SUPPLY_GAS, "supply_fid": "gas-live", "premises_id": PREMISES}
+    fake = SimpleNamespace(
+        plant=SimpleNamespace(tariff=TariffConfig.from_dict({"export_provider": "fuse"})),
+        _fuse_state={"tariffs": _Fake(None)._fuse_state["tariffs"], "supplies": [gas]},
+        _fuse_in_use=lambda: True,
+    )
+    targets = FoxessPlantCoordinator._fuse_meter_targets(fake)
+    assert [t["supply_type"] for t in targets] == [SUPPLY_EXPORT, SUPPLY_GAS]
+    fake._fuse_in_use = lambda: False
+    fake.plant = SimpleNamespace(tariff=TariffConfig.from_dict({"export_provider": "manual"}))
+    assert FoxessPlantCoordinator._fuse_meter_targets(fake) == []
 
 
 @pytest.mark.asyncio

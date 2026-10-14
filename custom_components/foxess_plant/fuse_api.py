@@ -28,9 +28,9 @@ import aiohttp
 from .fuse_parse import (
     SUPPLY_TYPES,
     FuseParseError,
+    account_supplies,
     apply_contract,
     contracted_supplies,
-    electricity_supplies,
     rsc_value,
     tariff_from_bill,
     tariff_from_cards,
@@ -283,16 +283,27 @@ def build_fuse_cache(
     return cache
 
 
-async def fetch_fuse_tariffs(client: FuseWebClient, *, today: date) -> dict[str, dict[str, Any]]:
-    """Every electricity supply Fuse currently supplies: {"ELEC_IMPORT": tariff dict, "ELEC_EXPORT": ...}."""
+async def fetch_fuse_tariffs(
+    client: FuseWebClient, *, today: date, supplies_out: list[dict[str, Any]] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Every electricity supply Fuse currently supplies: {"ELEC_IMPORT": tariff dict, "ELEC_EXPORT": ...}.
+
+    ``supplies_out`` receives every supply Fuse currently supplies, gas included ({supply_type, supply_fid,
+    premises_id}), for the meter readings (fuse_meter.py).
+    """
     if not client.has_session:
         raise FuseAuthRequired("Sign in to Fuse first")
     if not await client.signed_in():
         raise FuseAuthRequired("Fuse signed Fox Plant out - sign in again with a new code")
-    supplies = electricity_supplies(await client.customer_premises())
+    every = account_supplies(await client.customer_premises())
+    supplies = [s for s in every if s["supply_type"] in SUPPLY_TYPES]
     if not supplies:
         raise FuseApiError("No electricity supply on this Fuse account")
-    contracts = contracted_supplies(await client.current_contracts([s["supply_fid"] for s in supplies]))
+    contracts = contracted_supplies(await client.current_contracts([s["supply_fid"] for s in every]))
+    if supplies_out is not None:
+        supplies_out[:] = [
+            {k: s[k] for k in ("supply_type", "supply_fid", "premises_id")} for s in every if s["supply_fid"] in contracts
+        ]
     out: dict[str, dict[str, Any]] = {}
     for sup in supplies:
         contract = contracts.get(sup["supply_fid"])

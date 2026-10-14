@@ -278,10 +278,13 @@ class FoxessPlantFuseMeterSensor(CoordinatorEntity[FoxessPlantCoordinator], Sens
         meter = self._meter()
         attrs: dict[str, Any] = {"last_fetch_at": meter.get("last_fetch_at"), "last_error": meter.get("last_error")}
         for kind, info in self._directions().items():
-            direction = "import" if kind == "ELEC_IMPORT" else "export"
-            attrs[f"{direction}_statistic_id"] = info.get("statistic_id")
-            attrs[f"{direction}_data_up_to"] = info.get("data_up_to")
-            attrs[f"{direction}_yesterday_kwh"] = info.get("yesterday_kwh")
+            prefix = {"ELEC_IMPORT": "import", "ELEC_EXPORT": "export", "GAS": "gas"}.get(kind, kind.lower())
+            attrs[f"{prefix}_statistic_id"] = info.get("statistic_id")
+            attrs[f"{prefix}_data_up_to"] = info.get("data_up_to")
+            # gas may be in m³ (the unit attribute says which)
+            attrs[f"{prefix}_yesterday" if kind == "GAS" else f"{prefix}_yesterday_kwh"] = info.get("yesterday_kwh")
+            if kind == "GAS":
+                attrs["gas_unit"] = info.get("unit")
         return attrs
 
 

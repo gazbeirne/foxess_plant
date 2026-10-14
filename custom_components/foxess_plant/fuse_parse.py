@@ -23,6 +23,7 @@ FUSE_PROVIDER = "fuse"
 SUPPLY_IMPORT = "ELEC_IMPORT"
 SUPPLY_EXPORT = "ELEC_EXPORT"
 SUPPLY_TYPES = (SUPPLY_IMPORT, SUPPLY_EXPORT)
+SUPPLY_GAS = "GAS"  # meter readings only (fuse_meter.py); Fox Plant doesn't price gas
 UK_TZ = ZoneInfo("Europe/London")
 DAY_MINUTES = 24 * 60
 
@@ -384,6 +385,11 @@ def contracted_supplies(contracts_data: Any) -> dict[str, dict[str, Any]]:
 
 def electricity_supplies(premises_data: Any) -> list[dict[str, Any]]:
     """[{premises_id, supply_fid, supply_type, identifier}] for every electricity import/export supply."""
+    return account_supplies(premises_data, SUPPLY_TYPES)
+
+
+def account_supplies(premises_data: Any, types: tuple[str, ...] = (*SUPPLY_TYPES, SUPPLY_GAS)) -> list[dict[str, Any]]:
+    """[{premises_id, supply_fid, supply_type, identifier}] for the account's supplies of the given types."""
     out = []
     for entry in premises_data or []:
         if not isinstance(entry, dict):
@@ -391,7 +397,7 @@ def electricity_supplies(premises_data: Any) -> list[dict[str, Any]]:
         premises_id = (entry.get("premises") or {}).get("id")
         for sup in entry.get("supplies") or []:
             definition = (sup or {}).get("supply_definition") or {}
-            if definition.get("supply_type") in SUPPLY_TYPES and premises_id and sup.get("supply_fid"):
+            if definition.get("supply_type") in types and premises_id and sup.get("supply_fid"):
                 out.append(
                     {
                         "premises_id": premises_id,

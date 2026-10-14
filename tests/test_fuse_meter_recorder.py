@@ -34,3 +34,20 @@ async def test_statistics_are_written_and_continue(recorder_mock, hass) -> None:
 
     meta = await get_instance(hass).async_add_executor_job(list_statistic_ids, hass, {sid})
     assert meta[0]["name"] == "Fuse Grid Export" and meta[0]["statistics_unit_of_measurement"] == "kWh"
+
+
+@pytest.mark.asyncio
+async def test_gas_in_cubic_metres(recorder_mock, hass) -> None:
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import list_statistic_ids
+
+    from custom_components.foxess_plant.fuse_parse import SUPPLY_GAS
+
+    sid = fuse_meter.statistic_id("ENTRY1", SUPPLY_GAS)
+    start = datetime(2026, 10, 13, 6, 0, tzinfo=UTC)
+    rows = fuse_meter.statistics_rows([(start, 0.31), (start + timedelta(hours=1), 0.12)], start_sum=0.0)
+    fuse_meter.async_write_statistics(hass, SUPPLY_GAS, sid, rows, unit=fuse_meter.M3)
+    await async_wait_recording_done(hass)
+    meta = await get_instance(hass).async_add_executor_job(list_statistic_ids, hass, {sid})
+    assert meta[0]["name"] == "Fuse Gas" and meta[0]["statistics_unit_of_measurement"] == "m³"
+    assert await fuse_meter.async_last_statistic(hass, sid) == (start + timedelta(hours=1), pytest.approx(0.43))

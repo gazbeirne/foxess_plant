@@ -9,6 +9,9 @@ sensor. They go into long-term statistics instead (``async_add_external_statisti
 are what the Energy dashboard reads. Statistics are hourly, so each hour is its two half hours added up, and an hour
 is written only when both are ACTUAL. Writing is append-only from the last stored hour: re-fetching never counts
 anything twice. An hour still unconfirmed after GIVE_UP is skipped so one missing reading can't hold everything up.
+
+Gas is read too when Fuse supplies it, so a Fuse customer needs no second integration; its unit (kWh or m³) is
+taken from the readings. Only supplies with a current Fuse contract are read (onboarding / cancelled ones aren't).
 """
 
 from __future__ import annotations
@@ -17,22 +20,34 @@ from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-from .fuse_parse import SUPPLY_EXPORT, SUPPLY_IMPORT, UK_TZ, FuseParseError, rsc_value
+from .fuse_parse import SUPPLY_EXPORT, SUPPLY_GAS, SUPPLY_IMPORT, UK_TZ, FuseParseError, rsc_value
 
 ACTUAL = "ACTUAL"
 GIVE_UP = timedelta(days=3)
 FETCH_EVERY = timedelta(hours=6)
 RETRY_AFTER = timedelta(hours=1)
 BACKFILL_MONTHS = 3
-DIRECTION = {SUPPLY_IMPORT: "import", SUPPLY_EXPORT: "export"}
+_IDS = {SUPPLY_IMPORT: "grid_import", SUPPLY_EXPORT: "grid_export", SUPPLY_GAS: "gas"}
+_NAMES = {SUPPLY_IMPORT: "Fuse Grid Import", SUPPLY_EXPORT: "Fuse Grid Export", SUPPLY_GAS: "Fuse Gas"}
+KWH = "kWh"
+M3 = "m³"
 
 
 def statistic_id(entry_id: str, supply_type: str) -> str:
-    return f"foxess_plant:fuse_grid_{DIRECTION[supply_type]}_{entry_id.lower()}"
+    return f"foxess_plant:fuse_{_IDS[supply_type]}_{entry_id.lower()}"
 
 
 def statistic_name(supply_type: str) -> str:
-    return f"Fuse Grid {DIRECTION[supply_type].title()}"
+    return _NAMES[supply_type]
+
+
+def reading_unit(slots: list[dict[str, Any]]) -> str:
+    """kWh, or m³ when Fuse reports a gas meter's volume (the Energy dashboard's Gas section takes either).
+
+    Only electricity readings have been seen (kWh); the gas unit is read from the readings, not assumed.
+    """
+    units = {str(s.get("unit") or "").strip().lower() for s in slots if s.get("kwh") is not None}
+    return M3 if units & {"m3", "m³", "cubic_meters", "cubic metres", "cubic meters"} else KWH
 
 
 def parse_hh_page(text: str) -> list[dict[str, Any]]:
@@ -46,12 +61,13 @@ def parse_hh_page(text: str) -> list[dict[str, Any]]:
             start = _slot_start(r)
             if start is None:
                 continue
-            value = (r.get("reading") or {}).get("value")
+            reading = r.get("reading") or {}
+            value = reading.get("value")
             try:
-                kwh = float(value) if value not in (None, "") else None
+                kwh = float(value) if value not in (None, "") else None  # "kwh" holds m³ for a gas meter in m³
             except (TypeError, ValueError):
                 kwh = None
-            slots.append({"start": start, "kwh": kwh, "status": str(r.get("status") or "")})
+            slots.append({"start": start, "kwh": kwh, "status": str(r.get("status") or ""), "unit": reading.get("unit")})
     slots.sort(key=lambda s: s["start"])
     return slots
 
@@ -154,19 +170,22 @@ async def async_last_statistic(hass: Any, stat_id: str) -> tuple[datetime | None
     return when, float(rows[0].get("sum") or 0.0)
 
 
-def async_write_statistics(hass: Any, supply_type: str, stat_id: str, rows: list[dict[str, Any]]) -> None:
+def async_write_statistics(
+    hass: Any, supply_type: str, stat_id: str, rows: list[dict[str, Any]], *, unit: str = KWH
+) -> None:
     from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData
     from homeassistant.components.recorder.statistics import async_add_external_statistics
-    from homeassistant.const import UnitOfEnergy
-    from homeassistant.util.unit_conversion import EnergyConverter
+    from homeassistant.const import UnitOfEnergy, UnitOfVolume
+    from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
+    volume = unit == M3
     metadata = StatisticMetaData(
         mean_type=StatisticMeanType.NONE,
         has_sum=True,
         name=statistic_name(supply_type),
         source="foxess_plant",
         statistic_id=stat_id,
-        unit_class=EnergyConverter.UNIT_CLASS,
-        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        unit_class=VolumeConverter.UNIT_CLASS if volume else EnergyConverter.UNIT_CLASS,
+        unit_of_measurement=UnitOfVolume.CUBIC_METERS if volume else UnitOfEnergy.KILO_WATT_HOUR,
     )
     async_add_external_statistics(hass, metadata, [StatisticData(**row) for row in rows])
